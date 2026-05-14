@@ -124,6 +124,7 @@ class AsymFluxPipeWrapper:
 
         # --- Build VAE and scheduler (no text encoder needed - using ComfyUI CLIP) ---
         vae = OklabColorEncoder(**DEFAULT_VAE_CONFIG)
+        vae.to(device=self.device, dtype=self.dtype)
         scheduler = FlowAdapterScheduler(**DEFAULT_SCHEDULER_CONFIG)
 
         # --- Construct pipeline with dummy text_encoder/tokenizer ---
@@ -159,16 +160,34 @@ class AsymFluxPipeWrapper:
         if prefix:
             adapter_state_dict = {k[len(prefix):]: v for k, v in adapter_state_dict.items()}
 
-        # Load adapter weights using strict=False to handle mismatches
-        # This is more efficient than manual key-by-key copying
-        missing, unexpected = transformer.load_state_dict(adapter_state_dict, strict=False)
+        # Merge adapter weights into transformer using manual key-by-key copying.
+        # This is critical: load_state_dict with strict=False would still OVERWRITE
+        # ALL matching keys. But we only want to UPDATE keys that exist in BOTH
+        # the base model and adapter (typically LoRA/style adapter layers),
+        # preserving all other base model weights intact.
+        merged_count = 0
+        skipped_missing = 0
+        skipped_unexpected = 0
+        transformer_state_dict = transformer.state_dict()
         
-        if missing:
-            print(f"[AsymFLUX] Adapter: {len(missing)} keys not in adapter (skipped)")
-        if unexpected:
-            print(f"[AsymFLUX] Adapter: {len(unexpected)} extra keys in adapter (skipped)")
-        else:
-            print(f"[AsymFLUX] Adapter: all keys successfully loaded")
+        for key, value in adapter_state_dict.items():
+            if key in transformer_state_dict:
+                if transformer_state_dict[key].shape == value.shape:
+                    transformer_state_dict[key] = value.to(self.dtype)
+                    merged_count += 1
+                else:
+                    skipped_unexpected += 1
+            else:
+                skipped_unexpected += 1
+        
+        for key in transformer.state_dict():
+            if key not in adapter_state_dict:
+                skipped_missing += 1
+        
+        transformer.load_state_dict(transformer_state_dict, strict=True)
+        del transformer_state_dict
+        
+        print(f"[AsymFLUX] Adapter merged: {merged_count} keys updated, {skipped_missing} base-only keys preserved, {skipped_unexpected} keys skipped")
 
         # Clean up adapter state dict from memory
         del adapter_state_dict

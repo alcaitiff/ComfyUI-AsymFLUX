@@ -248,13 +248,19 @@ class AsymFluxSampler:
         guidance_scale, orthogonal_guidance, clamp_denoised, width, height
     ):
         # Extract c_crossattn from conditioning (piFlow pattern)
-        prompt_context, _ = _extract_context_from_conditioning(positive)
-        neg_context, _ = _extract_context_from_conditioning(negative)
+        prompt_context, pooled = _extract_context_from_conditioning(positive)
+        neg_context, neg_pooled = _extract_context_from_conditioning(negative)
 
         if prompt_context is None:
             raise RuntimeError("[AsymFLUX] No valid conditioning found in 'positive'. Connect a CLIP Text Encode node.")
         if neg_context is None:
             raise RuntimeError("[AsymFLUX] No valid conditioning found in 'negative'. Connect a CLIP Text Encode node.")
+
+        # Debug: print embedding shapes and dtypes to diagnose issues
+        print(f"[AsymFLUX] prompt_context shape={prompt_context.shape}, dtype={prompt_context.dtype}")
+        print(f"[AsymFLUX] neg_context shape={neg_context.shape}, dtype={neg_context.dtype}")
+        if pooled is not None:
+            print(f"[AsymFLUX] pooled shape={pooled.shape}, dtype={pooled.dtype}")
 
         images = pipeline.generate(
             prompt_embeds=prompt_context,

@@ -148,7 +148,24 @@ class AsymFluxPipeWrapper:
         if prefix:
             adapter_state_dict = {k[len(prefix):]: v for k, v in adapter_state_dict.items()}
 
-        missing, unexpected = transformer.load_state_dict(adapter_state_dict, strict=False)
+        # Filter out keys with shape mismatches (e.g. x_embedder/proj_out differ
+        # between base model channels=128 and adapter channels=768).
+        transformer_keys = {name: param.shape for name, param in transformer.named_parameters()}
+        filtered_adapter = {}
+        skipped = 0
+        for key, tensor in adapter_state_dict.items():
+            if key in transformer_keys:
+                if transformer_keys[key] == tensor.shape:
+                    filtered_adapter[key] = tensor
+                else:
+                    skipped += 1
+            else:
+                filtered_adapter[key] = tensor
+
+        if skipped:
+            print(f"[AsymFLUX] Adapter: skipped {skipped} key(s) with shape mismatch.")
+
+        missing, unexpected = transformer.load_state_dict(filtered_adapter, strict=False)
         if missing:
             print(f"[AsymFLUX] Adapter warning: missing keys ({len(missing)}): {missing[:5]}")
         if unexpected:

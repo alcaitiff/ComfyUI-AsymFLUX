@@ -2,13 +2,13 @@
 ComfyUI Custom Nodes for AsymFLUX.2-klein-9B
 
 Provides:
-  - AsymFluxLoader:  Loads the base FLUX.2-klein model + AsymFLUX adapter
+  - AsymFluxLoader:  Loads the base FLUX.2-klein model + AsymFLUX adapter from ComfyUI model folders
   - AsymFluxSampler: Runs pixel-space text-to-image generation (outputs IMAGE directly)
 """
 
 import numpy as np
 import torch
-from PIL import Image
+import folder_paths
 from .pipeline import AsymFluxPipeWrapper
 
 
@@ -38,7 +38,8 @@ def _get_or_load_pipe(base_model_path, adapter_path, device, dtype, enable_cpu_o
 # ---------------------------------------------------------------------------
 class AsymFluxLoader:
     """
-    Loads the FLUX.2-klein base model and attaches the AsymFLUX adapter.
+    Loads the FLUX.2-klein base model from ComfyUI's diffusion_models folder
+    and attaches an AsymFLUX adapter from the asymflux_adapters folder.
     Outputs a pipeline wrapper object used by the AsymFLUX Sampler.
     """
 
@@ -46,16 +47,11 @@ class AsymFluxLoader:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "base_model_path": ("STRING", {
-                    "default": "black-forest-labs/FLUX.2-klein-base-9B",
-                    "tooltip": "HuggingFace repo ID or local path to the FLUX.2-klein base model.",
+                "base_model_name": (folder_paths.get_filename_list("diffusion_models"), {
+                    "tooltip": "FLUX.2-klein base model from ComfyUI's diffusion_models folder.",
                 }),
-                "adapter_path": ("STRING", {
-                    "default": "Lakonik/AsymFLUX.2-klein-9B",
-                    "tooltip": "HuggingFace repo ID or local path to the AsymFLUX adapter weights.",
-                }),
-                "device": (["cuda", "cpu"], {
-                    "default": "cuda",
+                "adapter_name": (folder_paths.get_filename_list("asymflux_adapters"), {
+                    "tooltip": "AsymFLUX adapter weights from the asymflux_adapters folder.",
                 }),
                 "dtype": (["bf16", "fp16", "fp32"], {
                     "default": "bf16",
@@ -74,7 +70,7 @@ class AsymFluxLoader:
     CATEGORY = "AsymFLUX"
     DESCRIPTION = "Load the FLUX.2-klein base model and attach the AsymFLUX pixel-space adapter."
 
-    def load(self, base_model_path, adapter_path, device, dtype, enable_cpu_offload):
+    def load(self, base_model_name, adapter_name, dtype, enable_cpu_offload):
         dtype_map = {
             "bf16": torch.bfloat16,
             "fp16": torch.float16,
@@ -82,8 +78,11 @@ class AsymFluxLoader:
         }
         torch_dtype = dtype_map[dtype]
 
+        base_model_path = folder_paths.get_full_path_or_raise("diffusion_models", base_model_name)
+        adapter_path = folder_paths.get_full_path_or_raise("asymflux_adapters", adapter_name)
+
         pipe = _get_or_load_pipe(
-            base_model_path, adapter_path, device, torch_dtype, enable_cpu_offload
+            base_model_path, adapter_path, "cuda", torch_dtype, enable_cpu_offload
         )
         return (pipe,)
 

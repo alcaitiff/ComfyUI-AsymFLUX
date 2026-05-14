@@ -60,6 +60,7 @@ class AsymFluxPipeWrapper:
         vae = OklabColorEncoder(**DEFAULT_VAE_CONFIG)
         scheduler = FlowAdapterScheduler(**DEFAULT_SCHEDULER_CONFIG)
 
+        # Load base model from local file path (safetensors/ckpt from ComfyUI models folder)
         self.pipe = PixelFlux2KleinPipeline.from_pretrained(
             base_model_path,
             vae=vae,
@@ -67,6 +68,7 @@ class AsymFluxPipeWrapper:
             torch_dtype=self.dtype,
         )
 
+        # Load adapter from local safetensors file path
         self.adapter_name = self.pipe.load_lakonlab_adapter(
             adapter_path,
             target_module_name='transformer',

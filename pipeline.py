@@ -38,16 +38,17 @@ DEFAULT_VAE_CONFIG = dict(
 )
 
 # FLUX.2-klein transformer config for _AsymFlux2Transformer2DModel
+# These params are from LakonLab's official asymflux2_klein config
 # (AsymFLUX requires the custom transformer with x_t/condition_latents support)
 TRANSFORMER_CONFIG = {
     "patch_size": 16,
     "in_channels": 3,
     "base_rank": 128,
     "num_layers": 8,
-    "num_single_layers": 48,
+    "num_single_layers": 24,  # FLUX.2-klein: 24 (NOT 48)
     "attention_head_dim": 128,
-    "num_attention_heads": 48,
-    "joint_attention_dim": 15360,
+    "num_attention_heads": 32,  # FLUX.2-klein: 32 (NOT 48)
+    "joint_attention_dim": 12288,  # FLUX.2-klein: 12288 (NOT 15360)
     "timestep_guidance_channels": 256,
     "mlp_ratio": 3.0,
     "axes_dims_rope": (32, 32, 32, 32),
@@ -150,34 +151,27 @@ class AsymFluxPipeWrapper:
             if key.startswith("transformer."):
                 prefix = "transformer."
                 break
+            if key.startswith("model."):
+                prefix = "model."
+                break
 
         if prefix:
             adapter_state_dict = {k[len(prefix):]: v for k, v in adapter_state_dict.items()}
 
-        # Build a name→shape map from the already-loaded transformer, then only
-        # apply adapter keys whose shape matches (piFlow's load_model_weights does
-        # this implicitly by iterating over the merged dict key-by-key).
-        param_shapes = {n: p.shape for n, p in transformer.named_parameters()}
-        applied = 0
-        skipped_shape = 0
-        skipped_missing = 0
-        for key, tensor in adapter_state_dict.items():
-            if key in param_shapes:
-                if param_shapes[key] == tensor.shape:
-                    # Direct in-place copy via the module's state dict (piFlow pattern).
-                    transformer.state_dict()[key].copy_(tensor.to(device=transformer.state_dict()[key].device))
-                    applied += 1
-                else:
-                    skipped_shape += 1
-            else:
-                skipped_missing += 1
+        # Load adapter weights using strict=False to handle mismatches
+        # This is more efficient than manual key-by-key copying
+        missing, unexpected = transformer.load_state_dict(adapter_state_dict, strict=False)
+        
+        if missing:
+            print(f"[AsymFLUX] Adapter: {len(missing)} keys not in adapter (skipped)")
+        if unexpected:
+            print(f"[AsymFLUX] Adapter: {len(unexpected)} extra keys in adapter (skipped)")
+        else:
+            print(f"[AsymFLUX] Adapter: all keys successfully loaded")
 
-        if skipped_shape:
-            print(f"[AsymFLUX] Adapter: skipped {skipped_shape} key(s) with shape mismatch.")
-        if skipped_missing:
-            print(f"[AsymFLUX] Adapter: skipped {skipped_missing} key(s) not in model.")
-        print(f"[AsymFLUX] Adapter applied: {applied} keys.")
-
+        # Clean up adapter state dict from memory
+        del adapter_state_dict
+        
         self.adapter_name = adapter_path  # track which adapter is loaded
         print(f"[AsymFLUX] Adapter loaded: {self.adapter_name}")
 

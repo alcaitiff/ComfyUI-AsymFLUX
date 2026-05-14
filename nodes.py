@@ -45,17 +45,21 @@ def _extract_context_from_conditioning(conditioning):
     """
     Extract text context and pooled output from ComfyUI's CONDITIONING.
 
-    piFlow pattern: ComfyUI CONDITIONING is a nested structure:
+    ComfyUI CONDITIONING raw structure (as returned by CLIPTextEncode):
       conditioning = [
           branch_0: [                          # positive conditions
-              [metadata_dict_0, conditioning_dict_0],
-              [metadata_dict_1, conditioning_dict_1],
+              [text_tensor_0, metadata_dict_0],
+              [text_tensor_1, metadata_dict_1],
               ...
           ]
       ]
 
-    Each item in a branch is a 2-element list: [metadata, dict].
-    The actual conditioning data lives at index [1].
+    Each item in a branch is a 2-element list: [tensor, dict].
+    - Index [0] = the text embedding tensor (cross-attention context)
+    - Index [1] = dict with metadata like "pooled_output", "guidance", etc.
+
+    Note: During sampling ComfyUI's convert_cond() moves the tensor into
+    the dict under "cross_attn", but nodes receive the raw format above.
 
     Returns (context_tensor, pooled_output) or (None, None) if empty.
     """
@@ -69,26 +73,29 @@ def _extract_context_from_conditioning(conditioning):
     pooled_tensors = []
 
     for cond_item in cond_list:
-        # piFlow pattern: each item is [metadata, dict] — extract the dict at index [1]
+        # ComfyUI pattern: each item is [tensor, dict]
         if isinstance(cond_item, (list, tuple)) and len(cond_item) >= 2:
+            cond_tensor = cond_item[0]
             cond_dict = cond_item[1]
-        elif isinstance(cond_item, dict):
-            cond_dict = cond_item
+        elif isinstance(cond_item, torch.Tensor):
+            # Edge case: bare tensor in the list
+            cond_tensor = cond_item
+            cond_dict = {}
         else:
             continue
 
-        if not isinstance(cond_dict, dict):
-            continue
+        # The text embedding tensor lives at index [0]
+        if isinstance(cond_tensor, torch.Tensor):
+            context_tensors.append(cond_tensor)
+        elif isinstance(cond_dict, dict):
+            # Fallback: after convert_cond() the tensor may be under "cross_attn"
+            for key in ("cross_attn", "cond", "c_crossattn"):
+                if key in cond_dict and isinstance(cond_dict[key], torch.Tensor):
+                    context_tensors.append(cond_dict[key])
+                    break
 
-        # FLUX / modern ComfyUI uses 'cond' key for cross-attention context
-        if "cond" in cond_dict:
-            context_tensors.append(cond_dict["cond"])
-        # Legacy SD1.5/SDXL uses 'c_crossattn'
-        elif "c_crossattn" in cond_dict:
-            context_tensors.append(cond_dict["c_crossattn"])
-
-        # pooled_output may be needed as vector guidance (y) for FLUX models
-        if "pooled_output" in cond_dict:
+        # pooled_output lives in the metadata dict at index [1]
+        if isinstance(cond_dict, dict) and "pooled_output" in cond_dict:
             pooled_tensors.append(cond_dict["pooled_output"])
 
     if not context_tensors:

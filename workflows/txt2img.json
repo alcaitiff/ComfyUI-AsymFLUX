@@ -1,0 +1,86 @@
+{
+  "last_node_id": 4,
+  "last_link_id": 2,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "AsymFluxLoader",
+      "pos": [100, 200],
+      "size": [400, 200],
+      "properties": {},
+      "widgets_values": [
+        "black-forest-labs/FLUX.2-klein-base-9B",
+        "Lakonik/AsymFLUX.2-klein-9B",
+        "cuda",
+        "bf16",
+        false
+      ],
+      "outputs": [
+        {
+          "name": "pipeline",
+          "type": "ASYM_PIPE",
+          "links": [1]
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "AsymFluxSampler",
+      "pos": [600, 200],
+      "size": [400, 450],
+      "properties": {},
+      "widgets_values": [
+        "Restored color photo from the 1900s. A middle-aged man with cybernetic metal hands is sitting on an old wooden chair and reading the newspaper. Close-up shot focusing on the newspaper.",
+        "Low quality, worst quality, blurry, deformed, bad anatomy",
+        42,
+        38,
+        4.0,
+        1.0,
+        true,
+        960,
+        1280
+      ],
+      "inputs": [
+        {
+          "name": "pipeline",
+          "type": "ASYM_PIPE",
+          "link": 1
+        }
+      ],
+      "outputs": [
+        {
+          "name": "image",
+          "type": "IMAGE",
+          "links": [2]
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "PreviewImage",
+      "pos": [1100, 200],
+      "size": [400, 400],
+      "properties": {},
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 2
+        }
+      ]
+    }
+  ],
+  "links": [
+    [1, 1, 0, 2, 0, "ASYM_PIPE"],
+    [2, 2, 0, 3, 0, "IMAGE"]
+  ],
+  "groups": [],
+  "config": {},
+  "extra": {
+    "ds": {
+      "scale": 1.0,
+      "offset": [0, 0]
+    }
+  },
+  "version": 0.4
+}

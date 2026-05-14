@@ -1,0 +1,12 @@
+# LakonLab (provides PixelFlux2KleinPipeline, OklabColorEncoder, FlowAdapterScheduler)
+# Install from source: pip install -e . --no-build-isolation
+# from https://github.com/Lakonik/LakonLab
+lakonlab @ git+https://github.com/Lakonik/LakonLab.git
+
+# LakonLab's own pinned dependencies (will be pulled automatically by setup.py):
+# diffusers==0.37.0
+# transformers==4.57.3
+# peft==0.17.0
+# accelerate
+# sentencepiece
+# bitsandbytes>=0.46.1

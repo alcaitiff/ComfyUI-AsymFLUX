@@ -14,7 +14,26 @@ Custom [ComfyUI](https://github.com/comfyanonymous/ComfyUI) nodes for running [A
 | Node | Description |
 |------|-------------|
 | **AsymFLUX Loader** | Loads the FLUX.2-klein base model and attaches the AsymFLUX adapter |
-| **AsymFLUX Sampler** | Runs text-to-image generation, outputs `IMAGE` directly |
+| **AsymFLUX Sampler** | Runs text-to-image generation using CONDITIONING from CLIP Text Encode nodes, outputs `IMAGE` directly |
+
+## Workflow (piFlow-style)
+
+This extension follows the same pattern as [ComfyUI-piFlow](https://github.com/baptiste146970/ComfyUI-piFlow):
+
+```
+CLIPLoader → CLIPTextEncode (positive)  ──┐
+                                            ├──→ AsymFluxSampler → PreviewImage
+CLIPLoader → CLIPTextEncode (negative) ────┘
+AsymFluxLoader ─────────────────────────────┘
+```
+
+1. **Load the CLIP** text encoder (`mistral_3_small_flux2_fp8.safetensors`, type `flux2`)
+2. **Encode prompts** using `CLIPTextEncode` nodes (positive + negative)
+3. **Load the model** using `AsymFluxLoader` (base model + adapter)
+4. **Sample** using `AsymFluxSampler` — connects pipeline, positive conditioning, and negative conditioning
+5. **Preview** the output image
+
+See `workflows/txt2img.json` for a ready-to-use workflow.
 
 ## Prerequisites
 
@@ -43,6 +62,14 @@ Custom [ComfyUI](https://github.com/comfyanonymous/ComfyUI) nodes for running [A
    ```
 
 4. Start ComfyUI and load the example workflow from `workflows/txt2img.json`.
+
+## Model Files
+
+| File | Location | Source |
+|------|----------|--------|
+| `FLUX.2-klein-base-9B.safetensors` | `models/diffusion_models/` | [HuggingFace](https://huggingface.co/black-forest-labs/FLUX.2-klein-base-9B) |
+| `AsymFLUX.2-klein-9B.safetensors` | `models/asymflux_adapters/` | [HuggingFace](https://huggingface.co/Lakonik/AsymFLUX.2-klein-9B) |
+| `mistral_3_small_flux2_fp8.safetensors` | `models/text_encoders/` | [Comfy-Org/flux2-dev](https://huggingface.co/Comfy-Org/flux2-dev) |
 
 ## Recommended Settings
 

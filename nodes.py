@@ -43,37 +43,53 @@ def _get_or_load_pipe(base_model_path, adapter_path, device, dtype, enable_cpu_o
 # ---------------------------------------------------------------------------
 def _extract_context_from_conditioning(conditioning):
     """
-    Extract c_crossattn (text context) from ComfyUI's CONDITIONING.
+    Extract text context and pooled output from ComfyUI's CONDITIONING.
 
-    piFlow pattern: ComfyUI stores the text encoder output under 'c_crossattn'
-    in each conditioning item dict. We concatenate all items along batch dim.
+    piFlow pattern: ComfyUI CONDITIONING is a nested structure:
+      conditioning = [
+          branch_0: [                          # positive conditions
+              [metadata_dict_0, conditioning_dict_0],
+              [metadata_dict_1, conditioning_dict_1],
+              ...
+          ]
+      ]
+
+    Each item in a branch is a 2-element list: [metadata, dict].
+    The actual conditioning data lives at index [1].
 
     Returns (context_tensor, pooled_output) or (None, None) if empty.
     """
     if conditioning is None or len(conditioning) == 0:
         return None, None
 
-    # CONDITIONING is list[list[dict]] — first level is condition branch
+    # CONDITIONING is list[list[...]] — first level is condition branch
     cond_list = conditioning[0] if isinstance(conditioning[0], list) else conditioning
 
     context_tensors = []
     pooled_tensors = []
 
     for cond_item in cond_list:
-        # Skip non-dict items (e.g. tensors) — conditioning structure varies by model type
-        if not isinstance(cond_item, dict):
+        # piFlow pattern: each item is [metadata, dict] — extract the dict at index [1]
+        if isinstance(cond_item, (list, tuple)) and len(cond_item) >= 2:
+            cond_dict = cond_item[1]
+        elif isinstance(cond_item, dict):
+            cond_dict = cond_item
+        else:
+            continue
+
+        if not isinstance(cond_dict, dict):
             continue
 
         # FLUX / modern ComfyUI uses 'cond' key for cross-attention context
-        if "cond" in cond_item:
-            context_tensors.append(cond_item["cond"])
+        if "cond" in cond_dict:
+            context_tensors.append(cond_dict["cond"])
         # Legacy SD1.5/SDXL uses 'c_crossattn'
-        elif "c_crossattn" in cond_item:
-            context_tensors.append(cond_item["c_crossattn"])
+        elif "c_crossattn" in cond_dict:
+            context_tensors.append(cond_dict["c_crossattn"])
 
         # pooled_output may be needed as vector guidance (y) for FLUX models
-        if "pooled_output" in cond_item:
-            pooled_tensors.append(cond_item["pooled_output"])
+        if "pooled_output" in cond_dict:
+            pooled_tensors.append(cond_dict["pooled_output"])
 
     if not context_tensors:
         return None, None

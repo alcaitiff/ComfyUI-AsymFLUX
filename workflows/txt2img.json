@@ -1,17 +1,16 @@
 {
-  "last_node_id": 4,
-  "last_link_id": 2,
+  "last_node_id": 7,
+  "last_link_id": 7,
   "nodes": [
     {
       "id": 1,
       "type": "AsymFluxLoader",
-      "pos": [100, 200],
-      "size": [400, 200],
+      "pos": [20, 50],
+      "size": [350, 160],
       "properties": {},
       "widgets_values": [
-        "black-forest-labs/FLUX.2-klein-base-9B",
-        "Lakonik/AsymFLUX.2-klein-9B",
-        "cuda",
+        "FLUX.2-klein-base-9B.safetensors",
+        "AsymFLUX.2-klein-9B.safetensors",
         "bf16",
         false
       ],
@@ -19,20 +18,92 @@
         {
           "name": "pipeline",
           "type": "ASYM_PIPE",
-          "links": [1]
+          "links": [1],
+          "slot_index": 0
         }
       ]
     },
     {
       "id": 2,
-      "type": "AsymFluxSampler",
-      "pos": [600, 200],
-      "size": [400, 450],
+      "type": "CLIPLoader",
+      "pos": [20, 240],
+      "size": [350, 110],
       "properties": {},
       "widgets_values": [
-        "Restored color photo from the 1900s. A middle-aged man with cybernetic metal hands is sitting on an old wooden chair and reading the newspaper. Close-up shot focusing on the newspaper.",
-        "Low quality, worst quality, blurry, deformed, bad anatomy",
+        "mistral_3_small_flux2_fp8.safetensors",
+        "flux2",
+        "default"
+      ],
+      "outputs": [
+        {
+          "name": "CLIP",
+          "type": "CLIP",
+          "links": [2, 3],
+          "slot_index": 0
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "CLIPTextEncode",
+      "pos": [400, 100],
+      "size": [420, 180],
+      "properties": {},
+      "title": "Positive Prompt",
+      "widgets_values": [
+        "Restored color photo from the 1900s. A middle-aged man with cybernetic metal hands is sitting on an old wooden chair and reading the newspaper. The newspaper has the prominent headline \"AsymFLOW RELEASED\" in large bold font. Close-up shot focusing on the newspaper."
+      ],
+      "inputs": [
+        {
+          "name": "clip",
+          "type": "CLIP",
+          "link": 2
+        }
+      ],
+      "outputs": [
+        {
+          "name": "CONDITIONING",
+          "type": "CONDITIONING",
+          "links": [4],
+          "slot_index": 0
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "CLIPTextEncode",
+      "pos": [400, 320],
+      "size": [420, 180],
+      "properties": {},
+      "title": "Negative Prompt",
+      "widgets_values": [
+        "Low quality, worst quality, blurry, deformed, bad anatomy, unclear text"
+      ],
+      "inputs": [
+        {
+          "name": "clip",
+          "type": "CLIP",
+          "link": 3
+        }
+      ],
+      "outputs": [
+        {
+          "name": "CONDITIONING",
+          "type": "CONDITIONING",
+          "links": [5],
+          "slot_index": 0
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "AsymFluxSampler",
+      "pos": [860, 100],
+      "size": [350, 420],
+      "properties": {},
+      "widgets_values": [
         42,
+        false,
         38,
         4.0,
         1.0,
@@ -45,36 +116,76 @@
           "name": "pipeline",
           "type": "ASYM_PIPE",
           "link": 1
+        },
+        {
+          "name": "positive",
+          "type": "CONDITIONING",
+          "link": 4
+        },
+        {
+          "name": "negative",
+          "type": "CONDITIONING",
+          "link": 5
         }
       ],
       "outputs": [
         {
           "name": "image",
           "type": "IMAGE",
-          "links": [2]
+          "links": [6],
+          "slot_index": 0
         }
       ]
     },
     {
-      "id": 3,
+      "id": 6,
       "type": "PreviewImage",
-      "pos": [1100, 200],
+      "pos": [1250, 100],
       "size": [400, 400],
       "properties": {},
       "inputs": [
         {
           "name": "images",
           "type": "IMAGE",
-          "link": 2
+          "link": 6
         }
       ]
     }
   ],
   "links": [
-    [1, 1, 0, 2, 0, "ASYM_PIPE"],
-    [2, 2, 0, 3, 0, "IMAGE"]
+    [1, 1, 0, 5, 0, "ASYM_PIPE"],
+    [2, 2, 0, 3, 0, "CLIP"],
+    [3, 2, 0, 4, 0, "CLIP"],
+    [4, 3, 0, 5, 1, "CONDITIONING"],
+    [5, 4, 0, 5, 2, "CONDITIONING"],
+    [6, 5, 0, 6, 0, "IMAGE"]
   ],
-  "groups": [],
+  "groups": [
+    {
+      "id": 1,
+      "title": "Step 1 - Load models",
+      "bounding": [10, 20, 370, 350],
+      "color": "#3f789e",
+      "font_size": 24,
+      "flags": {}
+    },
+    {
+      "id": 2,
+      "title": "Step 2 - Prompts",
+      "bounding": [390, 60, 450, 470],
+      "color": "#3f789e",
+      "font_size": 24,
+      "flags": {}
+    },
+    {
+      "id": 3,
+      "title": "Step 3 - Sample & Preview",
+      "bounding": [850, 60, 820, 490],
+      "color": "#3f789e",
+      "font_size": 24,
+      "flags": {}
+    }
+  ],
   "config": {},
   "extra": {
     "ds": {

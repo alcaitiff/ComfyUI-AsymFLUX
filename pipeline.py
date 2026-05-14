@@ -132,13 +132,16 @@ class AsymFluxPipeWrapper:
             transformer=transformer,
         )
 
-        # --- Load adapter weights directly from safetensors ---
-        # load_lakonlab_adapter expects a directory with JSON config,
-        # but ComfyUI stores adapters as raw .safetensors files.
+        # --- Load adapter weights directly from safetensors (piFlow pattern) ---
+        # piFlow merges adapter weights into the base state dict BEFORE building
+        # the model, then uses load_model_weights which iterates key-by-key and
+        # silently skips mismatches. We replicate this pattern here: load the
+        # adapter state dict, then manually apply only keys that match both name
+        # AND shape — no load_state_dict call that can crash on size mismatch.
         print(f"[AsymFLUX] Loading adapter from: {adapter_path}")
         adapter_state_dict = load_file(adapter_path)
 
-        # Strip any prefix if present
+        # Strip any prefix if present (piFlow does the same with unet_prefix_from_state_dict)
         prefix = ""
         for key in list(adapter_state_dict.keys()):
             if key.startswith("transformer."):
@@ -148,28 +151,29 @@ class AsymFluxPipeWrapper:
         if prefix:
             adapter_state_dict = {k[len(prefix):]: v for k, v in adapter_state_dict.items()}
 
-        # Filter out keys with shape mismatches (e.g. x_embedder/proj_out differ
-        # between base model channels=128 and adapter channels=768).
-        transformer_keys = {name: param.shape for name, param in transformer.named_parameters()}
-        filtered_adapter = {}
-        skipped = 0
+        # Build a name→shape map from the already-loaded transformer, then only
+        # apply adapter keys whose shape matches (piFlow's load_model_weights does
+        # this implicitly by iterating over the merged dict key-by-key).
+        param_shapes = {n: p.shape for n, p in transformer.named_parameters()}
+        applied = 0
+        skipped_shape = 0
+        skipped_missing = 0
         for key, tensor in adapter_state_dict.items():
-            if key in transformer_keys:
-                if transformer_keys[key] == tensor.shape:
-                    filtered_adapter[key] = tensor
+            if key in param_shapes:
+                if param_shapes[key] == tensor.shape:
+                    # Direct in-place copy via the module's state dict (piFlow pattern).
+                    transformer.state_dict()[key].copy_(tensor.to(device=transformer.state_dict()[key].device))
+                    applied += 1
                 else:
-                    skipped += 1
+                    skipped_shape += 1
             else:
-                filtered_adapter[key] = tensor
+                skipped_missing += 1
 
-        if skipped:
-            print(f"[AsymFLUX] Adapter: skipped {skipped} key(s) with shape mismatch.")
-
-        missing, unexpected = transformer.load_state_dict(filtered_adapter, strict=False)
-        if missing:
-            print(f"[AsymFLUX] Adapter warning: missing keys ({len(missing)}): {missing[:5]}")
-        if unexpected:
-            print(f"[AsymFLUX] Adapter warning: unexpected keys ({len(unexpected)}): {unexpected[:5]}")
+        if skipped_shape:
+            print(f"[AsymFLUX] Adapter: skipped {skipped_shape} key(s) with shape mismatch.")
+        if skipped_missing:
+            print(f"[AsymFLUX] Adapter: skipped {skipped_missing} key(s) not in model.")
+        print(f"[AsymFLUX] Adapter applied: {applied} keys.")
 
         self.adapter_name = adapter_path  # track which adapter is loaded
         print(f"[AsymFLUX] Adapter loaded: {self.adapter_name}")

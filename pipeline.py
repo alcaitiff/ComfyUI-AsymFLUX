@@ -132,12 +132,29 @@ class AsymFluxPipeWrapper:
             transformer=transformer,
         )
 
-        # --- Load adapter using lakonlab's built-in PEFT adapter system ---
+        # --- Load adapter weights directly from safetensors ---
+        # load_lakonlab_adapter expects a directory with JSON config,
+        # but ComfyUI stores adapters as raw .safetensors files.
         print(f"[AsymFLUX] Loading adapter from: {adapter_path}")
-        self.adapter_name = self.pipe.load_lakonlab_adapter(
-            adapter_path,
-            target_module_name='transformer',
-        )
+        adapter_state_dict = load_file(adapter_path)
+
+        # Strip any prefix if present
+        prefix = ""
+        for key in list(adapter_state_dict.keys()):
+            if key.startswith("transformer."):
+                prefix = "transformer."
+                break
+
+        if prefix:
+            adapter_state_dict = {k[len(prefix):]: v for k, v in adapter_state_dict.items()}
+
+        missing, unexpected = transformer.load_state_dict(adapter_state_dict, strict=False)
+        if missing:
+            print(f"[AsymFLUX] Adapter warning: missing keys ({len(missing)}): {missing[:5]}")
+        if unexpected:
+            print(f"[AsymFLUX] Adapter warning: unexpected keys ({len(unexpected)}): {unexpected[:5]}")
+
+        self.adapter_name = adapter_path  # track which adapter is loaded
         print(f"[AsymFLUX] Adapter loaded: {self.adapter_name}")
 
         # --- Device placement ---

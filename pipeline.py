@@ -12,10 +12,10 @@ and uses ComfyUI's CLIP system for text encoding, following the piFlow pattern.
 import math
 import torch
 from safetensors.torch import load_file
-from diffusers import Flux2Transformer2DModel
 from lakonlab.models.architectures import OklabColorEncoder
 from lakonlab.models.diffusions.schedulers import FlowAdapterScheduler
 from lakonlab.pipelines.pipeline_pixelflux2_klein import PixelFlux2KleinPipeline
+from lakonlab.models.architectures.asymflow.asymflux2 import _AsymFlux2Transformer2DModel
 
 
 # Default scheduler parameters from the official example
@@ -37,30 +37,32 @@ DEFAULT_VAE_CONFIG = dict(
     std=0.16,
 )
 
-# FLUX.2-klein transformer config (embedded locally — no HuggingFace network call needed)
+# FLUX.2-klein transformer config for _AsymFlux2Transformer2DModel
+# (AsymFLUX requires the custom transformer with x_t/condition_latents support)
 TRANSFORMER_CONFIG = {
-    "_class_name": "Flux2Transformer2DModel",
-    "_diffusers_version": "0.37.0.dev0",
-    "attention_head_dim": 128,
-    "axes_dims_rope": [32, 32, 32, 32],
-    "eps": 1e-6,
-    "guidance_embeds": False,
-    "in_channels": 128,
-    "joint_attention_dim": 12288,
-    "mlp_ratio": 3.0,
-    "num_attention_heads": 32,
+    "patch_size": 16,
+    "in_channels": 3,
+    "base_rank": 128,
     "num_layers": 8,
-    "num_single_layers": 24,
-    "out_channels": None,
-    "patch_size": 1,
-    "rope_theta": 2000,
+    "num_single_layers": 48,
+    "attention_head_dim": 128,
+    "num_attention_heads": 48,
+    "joint_attention_dim": 15360,
     "timestep_guidance_channels": 256,
+    "mlp_ratio": 3.0,
+    "axes_dims_rope": (32, 32, 32, 32),
+    "rope_theta": 2000,
+    "eps": 1e-6,
+    "sigma_min": 1e-4,
+    "num_timesteps": 1,
+    "guidance_embeds": True,
 }
 
 
 def _load_transformer_from_safetensors(model_path, dtype):
     """
-    Load a Flux2Transformer2DModel from a raw safetensors file.
+    Load an _AsymFlux2Transformer2DModel from a raw safetensors file.
+    Uses LakonLab's custom AsymFLUX transformer (supports x_t, condition_latents args).
     Follows the piFlow pattern: load state dict -> detect prefix -> build model -> load weights.
     Uses an embedded config dict so no HuggingFace network call is needed.
     """
@@ -77,9 +79,10 @@ def _load_transformer_from_safetensors(model_path, dtype):
     if prefix:
         state_dict = {k[len(prefix):]: v for k, v in state_dict.items()}
 
-    # Build transformer from local config (no HuggingFace download)
-    print("[AsymFLUX] Building Flux2Transformer2DModel from local config...")
-    transformer = Flux2Transformer2DModel(**TRANSFORMER_CONFIG)
+    # Build transformer from local config using LakonLab's _AsymFlux2Transformer2DModel
+    # (no HuggingFace download needed)
+    print("[AsymFLUX] Building _AsymFlux2Transformer2DModel from local config...")
+    transformer = _AsymFlux2Transformer2DModel(**TRANSFORMER_CONFIG)
     transformer.to(dtype=dtype)
 
     missing, unexpected = transformer.load_state_dict(state_dict, strict=False)

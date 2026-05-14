@@ -37,14 +37,32 @@ DEFAULT_VAE_CONFIG = dict(
     std=0.16,
 )
 
-# HuggingFace repo for model config only (text encoding handled by ComfyUI CLIP)
-HF_REPO = "black-forest-labs/FLUX.2-klein-base-9B"
+# FLUX.2-klein transformer config (embedded locally — no HuggingFace network call needed)
+TRANSFORMER_CONFIG = {
+    "_class_name": "Flux2Transformer2DModel",
+    "_diffusers_version": "0.37.0.dev0",
+    "attention_head_dim": 128,
+    "axes_dims_rope": [32, 32, 32, 32],
+    "eps": 1e-6,
+    "guidance_embeds": False,
+    "in_channels": 128,
+    "joint_attention_dim": 12288,
+    "mlp_ratio": 3.0,
+    "num_attention_heads": 32,
+    "num_layers": 8,
+    "num_single_layers": 24,
+    "out_channels": None,
+    "patch_size": 1,
+    "rope_theta": 2000,
+    "timestep_guidance_channels": 256,
+}
 
 
 def _load_transformer_from_safetensors(model_path, dtype):
     """
     Load a Flux2Transformer2DModel from a raw safetensors file.
     Follows the piFlow pattern: load state dict -> detect prefix -> build model -> load weights.
+    Uses an embedded config dict so no HuggingFace network call is needed.
     """
     print(f"[AsymFLUX] Loading state dict from: {model_path}")
     state_dict = load_file(model_path)
@@ -59,12 +77,9 @@ def _load_transformer_from_safetensors(model_path, dtype):
     if prefix:
         state_dict = {k[len(prefix):]: v for k, v in state_dict.items()}
 
-    # Build transformer from HF config, then load weights
-    print("[AsymFLUX] Building Flux2Transformer2DModel from config...")
-    transformer = Flux2Transformer2DModel.from_config(
-        HF_REPO,
-        subfolder="transformer",
-    )
+    # Build transformer from local config (no HuggingFace download)
+    print("[AsymFLUX] Building Flux2Transformer2DModel from local config...")
+    transformer = Flux2Transformer2DModel(**TRANSFORMER_CONFIG)
     transformer.to(dtype=dtype)
 
     missing, unexpected = transformer.load_state_dict(state_dict, strict=False)

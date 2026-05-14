@@ -38,17 +38,18 @@ DEFAULT_VAE_CONFIG = dict(
 )
 
 # FLUX.2-klein transformer config for _AsymFlux2Transformer2DModel
-# These params are from LakonLab's official asymflux2_klein config
-# (AsymFLUX requires the custom transformer with x_t/condition_latents support)
+# These params are from LakonLab's official asymflux2_klein configs:
+#   configs/asymflow/asymflux2_klein_32gpus.py
+#   configs/asymflow/asymflux2_klein_test.py
 TRANSFORMER_CONFIG = {
     "patch_size": 16,
     "in_channels": 3,
     "base_rank": 128,
     "num_layers": 8,
-    "num_single_layers": 24,  # FLUX.2-klein: 24 (NOT 48)
+    "num_single_layers": 24,
     "attention_head_dim": 128,
-    "num_attention_heads": 32,  # FLUX.2-klein: 32 (NOT 48)
-    "joint_attention_dim": 12288,  # FLUX.2-klein: 12288 (NOT 15360)
+    "num_attention_heads": 32,
+    "joint_attention_dim": 12288,
     "timestep_guidance_channels": 256,
     "mlp_ratio": 3.0,
     "axes_dims_rope": (32, 32, 32, 32),
@@ -56,7 +57,7 @@ TRANSFORMER_CONFIG = {
     "eps": 1e-6,
     "sigma_min": 1e-4,
     "num_timesteps": 1,
-    "guidance_embeds": True,
+    "guidance_embeds": False,  # FLUX.2-klein uses guidance_embeds=False
 }
 
 

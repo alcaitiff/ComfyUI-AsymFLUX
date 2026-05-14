@@ -205,10 +205,10 @@ class AsymFluxPipeWrapper:
             prompt_embeds: Pre-computed text embeddings from ComfyUI CLIP (B, seq_len, hidden)
             negative_prompt_embeds: Negative prompt embeddings from ComfyUI CLIP
         """
-        # Ensure prompt embeddings are on the same device as the model
-        # ComfyUI's CLIP may output tensors on CPU, but the transformer is on GPU
-        prompt_embeds = prompt_embeds.to(self.device)
-        negative_prompt_embeds = negative_prompt_embeds.to(self.device)
+        # Ensure prompt embeddings are on the same device and dtype as the model
+        # ComfyUI's CLIP may output tensors on CPU in float32, but the transformer is on GPU in bfloat16
+        prompt_embeds = prompt_embeds.to(device=self.device, dtype=self.dtype)
+        negative_prompt_embeds = negative_prompt_embeds.to(device=self.device, dtype=self.dtype)
 
         generator = torch.Generator(device="cpu").manual_seed(seed)
 

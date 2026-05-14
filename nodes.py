@@ -60,8 +60,15 @@ def _extract_context_from_conditioning(conditioning):
     pooled_tensors = []
 
     for cond_item in cond_list:
-        # piFlow pattern: c_crossattn is the text context tensor
-        if "c_crossattn" in cond_item:
+        # Skip non-dict items (e.g. tensors) — conditioning structure varies by model type
+        if not isinstance(cond_item, dict):
+            continue
+
+        # FLUX / modern ComfyUI uses 'cond' key for cross-attention context
+        if "cond" in cond_item:
+            context_tensors.append(cond_item["cond"])
+        # Legacy SD1.5/SDXL uses 'c_crossattn'
+        elif "c_crossattn" in cond_item:
             context_tensors.append(cond_item["c_crossattn"])
 
         # pooled_output may be needed as vector guidance (y) for FLUX models

@@ -6,14 +6,13 @@ This is a pixel-space model (not latent-space), so the output is directly
 an image — no separate VAE decode step is needed.
 
 Loads transformer weights from ComfyUI's diffusion_models folder (safetensors)
-and text encoders/tokenizers from HuggingFace, following the piFlow pattern.
+and uses ComfyUI's CLIP system for text encoding, following the piFlow pattern.
 """
 
 import math
 import torch
 from safetensors.torch import load_file
 from diffusers import Flux2Transformer2DModel
-from transformers import Qwen3ForCausalLM, Qwen2TokenizerFast
 from lakonlab.models.architectures import OklabColorEncoder
 from lakonlab.models.diffusions.schedulers import FlowAdapterScheduler
 from lakonlab.pipelines.pipeline_pixelflux2_klein import PixelFlux2KleinPipeline
@@ -38,8 +37,8 @@ DEFAULT_VAE_CONFIG = dict(
     std=0.16,
 )
 
-# HuggingFace repo for text encoders / tokenizers (shared with FLUX.2-klein)
-TEXT_ENCODER_REPO = "black-forest-labs/FLUX.2-klein-base-9B"
+# HuggingFace repo for model config only (text encoding handled by ComfyUI CLIP)
+HF_REPO = "black-forest-labs/FLUX.2-klein-base-9B"
 
 
 def _load_transformer_from_safetensors(model_path, dtype):
@@ -63,7 +62,7 @@ def _load_transformer_from_safetensors(model_path, dtype):
     # Build transformer from HF config, then load weights
     print("[AsymFLUX] Building Flux2Transformer2DModel from config...")
     transformer = Flux2Transformer2DModel.from_config(
-        TEXT_ENCODER_REPO,
+        HF_REPO,
         subfolder="transformer",
     )
     transformer.to(dtype=dtype)
@@ -80,8 +79,8 @@ def _load_transformer_from_safetensors(model_path, dtype):
 class AsymFluxPipeWrapper:
     """
     Manages loading and caching of the PixelFlux2KleinPipeline.
-    Loads transformer from local safetensors (ComfyUI diffusion_models folder)
-    and text encoders/tokenizers from HuggingFace.
+    Loads transformer from local safetensors (ComfyUI diffusion_models folder).
+    Uses ComfyUI's CLIP system for text encoding (no HuggingFace downloads).
     """
 
     def __init__(
@@ -103,29 +102,18 @@ class AsymFluxPipeWrapper:
         # --- Load transformer from local safetensors (piFlow pattern) ---
         transformer = _load_transformer_from_safetensors(base_model_path, dtype)
 
-        # --- Load text encoder and tokenizer from HuggingFace ---
-        print("[AsymFLUX] Loading text encoder (Qwen3) from HuggingFace...")
-        text_encoder = Qwen3ForCausalLM.from_pretrained(
-            TEXT_ENCODER_REPO,
-            subfolder="text_encoder",
-            torch_dtype=dtype,
-        )
-        print("[AsymFLUX] Loading tokenizer (Qwen2) from HuggingFace...")
-        tokenizer = Qwen2TokenizerFast.from_pretrained(
-            TEXT_ENCODER_REPO,
-            subfolder="tokenizer",
-        )
-
-        # --- Build VAE and scheduler ---
+        # --- Build VAE and scheduler (no text encoder needed - using ComfyUI CLIP) ---
         vae = OklabColorEncoder(**DEFAULT_VAE_CONFIG)
         scheduler = FlowAdapterScheduler(**DEFAULT_SCHEDULER_CONFIG)
 
-        # --- Construct pipeline manually (bypass from_pretrained) ---
+        # --- Construct pipeline with dummy text_encoder/tokenizer ---
+        # We pass None for text_encoder/tokenizer since we'll provide pre-computed
+        # prompt_embeds from ComfyUI's CLIP system instead (piFlow pattern)
         self.pipe = PixelFlux2KleinPipeline(
             scheduler=scheduler,
             vae=vae,
-            text_encoder=text_encoder,
-            tokenizer=tokenizer,
+            text_encoder=None,
+            tokenizer=None,
             transformer=transformer,
         )
 
@@ -148,8 +136,8 @@ class AsymFluxPipeWrapper:
 
     def generate(
         self,
-        prompt: str,
-        negative_prompt: str = "",
+        prompt_embeds: torch.Tensor,
+        negative_prompt_embeds: torch.Tensor,
         width: int = 1024,
         height: int = 1024,
         num_inference_steps: int = 38,
@@ -159,13 +147,18 @@ class AsymFluxPipeWrapper:
         seed: int = 0,
     ):
         """
-        Run text-to-image generation. Returns a PIL Image.
+        Run text-to-image generation using pre-computed prompt embeddings.
+        Returns a PIL Image.
+        
+        Args:
+            prompt_embeds: Pre-computed text embeddings from ComfyUI CLIP (B, seq_len, hidden)
+            negative_prompt_embeds: Negative prompt embeddings from ComfyUI CLIP
         """
         generator = torch.Generator(device="cpu").manual_seed(seed)
 
         result = self.pipe(
-            prompt=prompt,
-            negative_prompt=negative_prompt,
+            prompt_embeds=prompt_embeds,
+            negative_prompt_embeds=negative_prompt_embeds,
             width=width,
             height=height,
             num_inference_steps=num_inference_steps,

@@ -605,11 +605,11 @@ class AsymFluxPipeWrapper:
         if negative_prompt_embeds.dim() == 2:
             negative_prompt_embeds = negative_prompt_embeds.unsqueeze(0)
 
-        # Ensure prompt embeddings are on the same device and dtype as the model
-        # ComfyUI's CLIP may output tensors on CPU in float32, but the transformer is on GPU in bfloat16
-        # Keep prompt embeddings in fp32 for numerical stability (the pipeline will cast as needed internally).
-        prompt_embeds = prompt_embeds.to(device=self.device, dtype=torch.float32)
-        negative_prompt_embeds = negative_prompt_embeds.to(device=self.device, dtype=torch.float32)
+        # Ensure prompt embeddings are on the same device and dtype as the transformer.
+        # The transformer uses Linear layers, which require mat1/mat2 dtypes to match.
+        target_dtype = getattr(getattr(self.pipe, "transformer", None), "dtype", self.dtype)
+        prompt_embeds = prompt_embeds.to(device=self.device, dtype=target_dtype)
+        negative_prompt_embeds = negative_prompt_embeds.to(device=self.device, dtype=target_dtype)
 
         # Diffusers' randn_tensor expects a generator on the same device as the target latents.
         # Using a CPU generator with CUDA latents can lead to errors or inconsistent behavior.

@@ -219,11 +219,22 @@ class AsymFluxPipeWrapper:
         """
         Run text-to-image generation using pre-computed prompt embeddings.
         Returns a PIL Image.
-        
+
         Args:
             prompt_embeds: Pre-computed text embeddings from ComfyUI CLIP (B, seq_len, hidden)
+                         or (seq_len, hidden) - batch dimension will be added if missing
             negative_prompt_embeds: Negative prompt embeddings from ComfyUI CLIP
         """
+        # Ensure prompt embeddings have a batch dimension.
+        # ComfyUI's CLIP outputs tensors of shape (seq_len, hidden_dim), but the
+        # PixelFlux2KleinPipeline expects (B, seq_len, hidden_dim). Without this
+        # fix, prompt_embeds.shape[0] returns seq_len instead of batch_size=1,
+        # causing the denoising loop to run with a wildly incorrect batch size.
+        if prompt_embeds.dim() == 2:
+            prompt_embeds = prompt_embeds.unsqueeze(0)
+        if negative_prompt_embeds.dim() == 2:
+            negative_prompt_embeds = negative_prompt_embeds.unsqueeze(0)
+
         # Ensure prompt embeddings are on the same device and dtype as the model
         # ComfyUI's CLIP may output tensors on CPU in float32, but the transformer is on GPU in bfloat16
         prompt_embeds = prompt_embeds.to(device=self.device, dtype=self.dtype)

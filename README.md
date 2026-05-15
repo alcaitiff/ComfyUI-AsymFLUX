@@ -20,20 +20,16 @@ Custom [ComfyUI](https://github.com/comfyanonymous/ComfyUI) nodes for running [A
 
 This extension follows the same pattern as [ComfyUI-piFlow](https://github.com/baptiste146970/ComfyUI-piFlow):
 
-```
-CLIPLoader → CLIPTextEncode (positive)  ──┐
-                                            ├──→ AsymFluxSampler → PreviewImage
-CLIPLoader → CLIPTextEncode (negative) ────┘
-AsymFluxLoader ─────────────────────────────┘
-```
+![AsymFLUX txt2img workflow](assets/WF.png)
 
-1. **Load the CLIP** text encoder (`mistral_3_small_flux2_fp8.safetensors`, type `flux2`)
+
+1. **Load the CLIP** text encoder (workflow default: `qwen_3_8b_fp8mixed.safetensors`, type `flux2`)
 2. **Encode prompts** using `CLIPTextEncode` nodes (positive + negative)
 3. **Load the model** using `AsymFluxLoader` (base model + adapter)
 4. **Sample** using `AsymFluxSampler` — connects pipeline, positive conditioning, and negative conditioning
 5. **Preview** the output image
 
-See `workflows/txt2img.json` for a ready-to-use workflow.
+See `workflows/txt2img.json` for the ready-to-use workflow shown above.
 
 ## Prerequisites
 
@@ -51,17 +47,11 @@ See `workflows/txt2img.json` for a ready-to-use workflow.
 
 2. Install [LakonLab](https://github.com/Lakonik/LakonLab) (the upstream library):
    ```bash
-   git clone https://github.com/Lakonik/LakonLab.git
-   cd LakonLab
-   pip install -e . --no-build-isolation
+   cd ComfyUI-AsymFLUX
+   pip install -r requirements.txt
    ```
 
-3. Login to HuggingFace (required for FLUX.2-klein base model access):
-   ```bash
-   huggingface-cli login
-   ```
-
-4. Start ComfyUI and load the example workflow from `workflows/txt2img.json`.
+3. Start ComfyUI and load the example workflow from `workflows/txt2img.json`.
 
 ## Model Files
 
@@ -69,7 +59,7 @@ See `workflows/txt2img.json` for a ready-to-use workflow.
 |------|----------|--------|
 | `FLUX.2-klein-base-9B.safetensors` | `models/diffusion_models/` | [HuggingFace](https://huggingface.co/black-forest-labs/FLUX.2-klein-base-9B) |
 | `AsymFLUX.2-klein-9B.safetensors` | `models/asymflux_adapters/` | [HuggingFace](https://huggingface.co/Lakonik/AsymFLUX.2-klein-9B) |
-| `mistral_3_small_flux2_fp8.safetensors` | `models/text_encoders/` | [Comfy-Org/flux2-dev](https://huggingface.co/Comfy-Org/flux2-dev) |
+| `qwen_3_8b_fp8mixed.safetensors` | `models/text_encoders/` | (Flux2 text encoder; workflow default) |
 
 ## Recommended Settings
 

@@ -181,12 +181,13 @@ def _convert_comfyui_to_diffusers_keys(state_dict):
         converted["context_embedder.weight"] = context_embedder
 
     # Time + guidance embedding
+    # Diffusers Flux2Transformer2DModel uses "time_in.*" keys
     time_in_linear1 = state_dict.get("time_in.in_layer.weight")
     if time_in_linear1 is not None:
-        converted["time_guidage_embed.timestep_embedder.linear_1.weight"] = time_in_linear1
+        converted["time_in.in_layer.weight"] = time_in_linear1
     time_in_linear2 = state_dict.get("time_in.out_layer.weight")
     if time_in_linear2 is not None:
-        converted["time_guidance_embed.timestep_embedder.linear_2.weight"] = time_in_linear2
+        converted["time_in.out_layer.weight"] = time_in_linear2
 
     # Note: FLUX.2-klein has guidance_embeds=False, so guidance_in keys may not exist
 
@@ -203,11 +204,18 @@ def _convert_comfyui_to_diffusers_keys(state_dict):
     if mod_single is not None:
         converted["single_stream_modulation.lin.weight"] = mod_single
 
-    # Output head
-    proj_out = state_dict.get("final_layer.linear.weight")
-    if proj_out is not None:
-        converted["final_layer.linear.weight"] = proj_out
+    # Input projections (these should already be 1:1, but ensure they're included)
+    x_embedder = state_dict.get("x_embedder.weight")
+    if x_embedder is not None and "x_embedder.weight" not in converted:
+        converted["x_embedder.weight"] = x_embedder
 
+    context_embedder = state_dict.get("context_embedder.weight")
+    if context_embedder is not None and "context_embedder.weight" not in converted:
+        converted["context_embedder.weight"] = context_embedder
+
+    # Output head - Diffusers Flux2Transformer2DModel key names:
+    # norm_out is AdaLayerNormContinuous → stored as "norm_out.linear.weight"
+    # proj_out is Linear → stored as "proj_out.weight"
     norm_out = state_dict.get("final_layer.adaLN_modulation.1.weight")
     if norm_out is not None:
         # swap_scale_shift: FLUX normalizes with (scale, shift) swapped vs standard LayerNorm
@@ -218,9 +226,13 @@ def _convert_comfyui_to_diffusers_keys(state_dict):
             shift_part = norm_out[:, :hidden]
             scale_part = norm_out[:, hidden:]
             swapped = torch.cat([scale_part, shift_part], dim=1)
-            converted["final_layer.adaLN_modulation.1.weight"] = swapped
+            converted["norm_out.linear.weight"] = swapped
         else:
-            converted["final_layer.adaLN_modulation.1.weight"] = norm_out
+            converted["norm_out.linear.weight"] = norm_out
+
+    proj_out = state_dict.get("final_layer.linear.weight")
+    if proj_out is not None:
+        converted["proj_out.weight"] = proj_out
 
     # Position embedding (pos_embed is a buffer, not a weight key — skip it)
 
@@ -319,32 +331,83 @@ class AsymFluxPipeWrapper:
             print("[AsymFLUX] Adapter is in ComfyUI format, converting to Diffusers format...")
             adapter_state_dict = _convert_comfyui_to_diffusers_keys(adapter_state_dict)
 
-        # Merge adapter weights into transformer using manual key-by-key copying.
+        # Separate base weights from LoRA weights.
+        # LoRA keys contain "lora_A" or "lora_B" and have different shapes than base model weights.
+        # They must be applied via the LoRA loading mechanism, not direct weight merging.
+        base_adapter_sd = {}
+        lora_adapter_sd = {}
+        
+        for key, value in adapter_state_dict.items():
+            if "lora" in key.lower():
+                lora_adapter_sd[key] = value
+            else:
+                base_adapter_sd[key] = value
+        
+        if lora_adapter_sd:
+            print(f"[AsymFLUX] Found {len(lora_adapter_sd)} LoRA keys in adapter (will be applied via LoRA mechanism)")
+
+        # Merge base adapter weights into transformer using manual key-by-key copying.
         # Only update keys that exist in BOTH the base model and adapter,
         # preserving all other base model weights intact.
         merged_count = 0
-        skipped_unexpected = 0
+        skipped_missing = 0
+        skipped_shape_mismatch = 0
         transformer_state_dict = transformer.state_dict()
         
-        for key, value in adapter_state_dict.items():
+        for key, value in base_adapter_sd.items():
             if key in transformer_state_dict:
                 if transformer_state_dict[key].shape == value.shape:
                     transformer_state_dict[key] = value.to(self.dtype)
                     merged_count += 1
                 else:
-                    print(f"[AsymFLUX] Adapter shape mismatch for {key}: "
-                          f"adapter={value.shape}, model={transformer_state_dict[key].shape}")
-                    skipped_unexpected += 1
+                    skipped_shape_mismatch += 1
+                    if skipped_shape_mismatch <= 5:
+                        print(f"[AsymFLUX] Adapter shape mismatch for {key}: "
+                              f"adapter={value.shape}, model={transformer_state_dict[key].shape}")
             else:
-                skipped_unexpected += 1
+                skipped_missing += 1
+                if skipped_missing <= 5:
+                    print(f"[AsymFLUX] Adapter key not found in model: {key}")
         
         transformer.load_state_dict(transformer_state_dict, strict=True)
         del transformer_state_dict
         
-        print(f"[AsymFLUX] Adapter merged: {merged_count} keys updated, {skipped_unexpected} keys skipped")
+        print(f"[AsymFLUX] Adapter merged: {merged_count} keys updated, "
+              f"{skipped_missing} missing, {skipped_shape_mismatch} shape mismatch")
 
-        # Clean up adapter state dict from memory
+        # Apply LoRA weights if present using the transformer's LoRA mechanism
+        if lora_adapter_sd:
+            # Check if transformer has LoRA support (from PEFT)
+            has_lora = hasattr(transformer, 'unload_lora') or any('lora' in p for p, _ in transformer.named_parameters())
+            if has_lora:
+                try:
+                    # Load LoRA state dict directly into the transformer
+                    # LoRA keys may have "transformer." prefix — strip it if present
+                    clean_lora_sd = {}
+                    for k, v in lora_adapter_sd.items():
+                        if k.startswith("transformer."):
+                            k = k[len("transformer."):]
+                        clean_lora_sd[k] = v
+                    
+                    transformer.load_state_dict(clean_lora_sd, strict=False)
+                    print(f"[AsymFLUX] LoRA weights applied: {len(clean_lora_sd)} keys")
+                except Exception as e:
+                    print(f"[AsymFLUX] Warning: Could not apply LoRA weights: {e}")
+            else:
+                # Fallback: merge LoRA weights directly if they match base model shapes
+                print("[AsymFLUX] LoRA fallback: merging weights directly")
+                for key, value in lora_adapter_sd.items():
+                    clean_key = key
+                    if clean_key.startswith("transformer."):
+                        clean_key = clean_key[len("transformer."):]
+                    if clean_key in transformer_state_dict and transformer_state_dict[clean_key].shape == value.shape:
+                        transformer_state_dict[clean_key] = value.to(self.dtype)
+                transformer.load_state_dict(transformer_state_dict, strict=True)
+
+        # Clean up adapter state dicts from memory
         del adapter_state_dict
+        del base_adapter_sd
+        del lora_adapter_sd
         
         self.adapter_name = adapter_path  # track which adapter is loaded
         print(f"[AsymFLUX] Adapter loaded: {self.adapter_name}")

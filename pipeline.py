@@ -172,8 +172,18 @@ def _convert_comfyui_to_diffusers_keys(state_dict):
 
     # --- Top-level modules ---
     # Input projections (1:1 mapping)
+    # ComfyUI format uses img_in/txt_in, Diffusers format uses x_embedder/context_embedder
+    img_in = state_dict.get("img_in.weight")
+    if img_in is not None:
+        converted["x_embedder.weight"] = img_in
+
+    txt_in = state_dict.get("txt_in.weight")
+    if txt_in is not None:
+        converted["context_embedder.weight"] = txt_in
+
+    # Also handle if keys are already in Diffusers format (some exports)
     x_embedder = state_dict.get("x_embedder.weight")
-    if x_embedder is not None:
+    if x_embedder is not None and "x_embedder.weight" not in converted:
         converted["x_embedder.weight"] = x_embedder
 
     context_embedder = state_dict.get("context_embedder.weight")
@@ -216,6 +226,10 @@ def _convert_comfyui_to_diffusers_keys(state_dict):
     # Output head - Diffusers Flux2Transformer2DModel key names:
     # norm_out is AdaLayerNormContinuous → stored as "norm_out.linear.weight"
     # proj_out is Linear → stored as "proj_out.weight"
+    in_channels = TRANSFORMER_CONFIG.get("in_channels", 3)
+    patch_size = TRANSFORMER_CONFIG.get("patch_size", 16)
+    expected_out_channels = in_channels * (patch_size ** 2)  # 3 * 256 = 768 for original model
+
     norm_out = state_dict.get("final_layer.adaLN_modulation.1.weight")
     if norm_out is not None:
         # swap_scale_shift: FLUX normalizes with (scale, shift) swapped vs standard LayerNorm
@@ -228,13 +242,32 @@ def _convert_comfyui_to_diffusers_keys(state_dict):
             swapped = torch.cat([scale_part, shift_part], dim=1)
             converted["norm_out.linear.weight"] = swapped
         else:
-            converted["norm_out.linear.weight"] = norm_out
+            # Norm shape mismatch — model may be subspace-projected
+            print(f"[AsymFLUX] Warning: norm_out weight shape {norm_out.shape} unexpected for hidden={hidden}. "
+                  f"Skipping (possibly subspace-projected base).")
 
     proj_out = state_dict.get("final_layer.linear.weight")
     if proj_out is not None:
-        converted["proj_out.weight"] = proj_out
+        expected_proj_shape = (expected_out_channels, hidden)  # (768, 4096) for original
+        if proj_out.shape == expected_proj_shape:
+            converted["proj_out.weight"] = proj_out
+        else:
+            # Base model was subspace-projected: proj_out has shape [base_rank, inner_dim]
+            # e.g., (128, 4096) instead of (768, 4096). Skip loading it — the adapter
+            # will provide the correct subspace-projected proj_out weights.
+            print(f"[AsymFLUX] Warning: proj_out.weight shape {proj_out.shape} does not match expected "
+                  f"{expected_proj_shape}. Skipping load (subspace-projected base detected).")
 
-    # Position embedding (pos_embed is a buffer, not a weight key — skip it)
+    # Copy subspace buffers from checkpoint if present
+    proj_buffer = state_dict.get("proj_buffer")
+    if proj_buffer is not None:
+        converted["_buffer_proj_buffer"] = proj_buffer
+        print(f"[AsymFLUX] Found proj_buffer in checkpoint: shape {proj_buffer.shape}")
+
+    scale_buffer = state_dict.get("scale_buffer")
+    if scale_buffer is not None:
+        converted["_buffer_scale_buffer"] = scale_buffer
+        print(f"[AsymFLUX] Found scale_buffer in checkpoint: shape {scale_buffer.shape}")
 
     return converted
 
@@ -245,6 +278,9 @@ def _load_transformer_from_safetensors(model_path, dtype):
     
     Converts keys from ComfyUI format (double_blocks.*, single_blocks.*) to 
     Diffusers/LakonLab format (transformer_blocks.*, single_transformer_blocks.*).
+    
+    Handles subspace-projected base models where proj_out has shape [base_rank, inner_dim]
+    instead of the original [in_channels*patch_size², inner_dim].
     
     Follows the piFlow pattern: load state dict → convert keys → build model → load weights.
     """
@@ -263,6 +299,17 @@ def _load_transformer_from_safetensors(model_path, dtype):
     transformer = _AsymFlux2Transformer2DModel(**TRANSFORMER_CONFIG)
     transformer.to(dtype=dtype)
 
+    # Separate buffer keys from parameter keys
+    buffer_keys = [k for k in converted_sd.keys() if k.startswith("_buffer_")]
+    param_keys = [k for k in converted_sd.keys() if not k.startswith("_buffer_")]
+    
+    # Extract buffer values
+    buffers_to_load = {}
+    for bk in buffer_keys:
+        buffer_name = bk.replace("_buffer_", "", 1)
+        buffers_to_load[buffer_name] = converted_sd.pop(bk)
+
+    # Load parameter weights (strict=False handles shape mismatches gracefully)
     missing, unexpected = transformer.load_state_dict(converted_sd, strict=False)
     if missing:
         print(f"[AsymFLUX] Warning: missing keys ({len(missing)}): {missing[:10]}")
@@ -271,6 +318,16 @@ def _load_transformer_from_safetensors(model_path, dtype):
 
     # Clean up converted state dict from memory
     del converted_sd
+
+    # Load subspace buffers onto the transformer
+    for buffer_name, buffer_value in buffers_to_load.items():
+        if hasattr(transformer, buffer_name):
+            transformer.register_buffer(buffer_name, buffer_value.to(dtype=dtype))
+            print(f"[AsymFLUX] Loaded buffer: {buffer_name} shape {buffer_value.shape}")
+        else:
+            # Register as new buffer if it doesn't exist yet
+            transformer.register_buffer(buffer_name, buffer_value.to(dtype=dtype))
+            print(f"[AsymFLUX] Registered new buffer: {buffer_name} shape {buffer_value.shape}")
 
     return transformer
 
@@ -331,20 +388,26 @@ class AsymFluxPipeWrapper:
             print("[AsymFLUX] Adapter is in ComfyUI format, converting to Diffusers format...")
             adapter_state_dict = _convert_comfyui_to_diffusers_keys(adapter_state_dict)
 
-        # Separate base weights from LoRA weights.
+        # Separate base weights from LoRA weights and buffer keys.
         # LoRA keys contain "lora_A" or "lora_B" and have different shapes than base model weights.
-        # They must be applied via the LoRA loading mechanism, not direct weight merging.
+        # Buffer keys (proj_buffer, scale_buffer) are not parameters — they must be handled separately.
         base_adapter_sd = {}
         lora_adapter_sd = {}
+        adapter_buffers = {}
         
         for key, value in adapter_state_dict.items():
             if "lora" in key.lower():
                 lora_adapter_sd[key] = value
+            elif key in ("proj_buffer", "scale_buffer"):
+                adapter_buffers[key] = value
             else:
                 base_adapter_sd[key] = value
         
         if lora_adapter_sd:
             print(f"[AsymFLUX] Found {len(lora_adapter_sd)} LoRA keys in adapter (will be applied via LoRA mechanism)")
+        
+        if adapter_buffers:
+            print(f"[AsymFLUX] Found {len(adapter_buffers)} buffer keys in adapter: {list(adapter_buffers.keys())}")
 
         # Merge base adapter weights into transformer using manual key-by-key copying.
         # Only update keys that exist in BOTH the base model and adapter,
@@ -374,6 +437,18 @@ class AsymFluxPipeWrapper:
         
         print(f"[AsymFLUX] Adapter merged: {merged_count} keys updated, "
               f"{skipped_missing} missing, {skipped_shape_mismatch} shape mismatch")
+
+        # Load adapter buffers (proj_buffer, scale_buffer) onto the transformer.
+        # These are registered buffers, not parameters, so they need separate handling.
+        for buffer_name, buffer_value in adapter_buffers.items():
+            if hasattr(transformer, buffer_name):
+                # Update existing buffer with adapter's version
+                transformer.register_buffer(buffer_name, buffer_value.to(dtype=self.dtype))
+                print(f"[AsymFLUX] Updated buffer: {buffer_name} shape {buffer_value.shape}")
+            else:
+                # Register new buffer
+                transformer.register_buffer(buffer_name, buffer_value.to(dtype=self.dtype))
+                print(f"[AsymFLUX] Registered new buffer: {buffer_name} shape {buffer_value.shape}")
 
         # Apply LoRA weights if present using the transformer's LoRA mechanism
         if lora_adapter_sd:

@@ -62,7 +62,7 @@ TRANSFORMER_CONFIG = {
     "eps": 1e-6,
     "sigma_min": 1e-4,
     "num_timesteps": 1,
-    "guidance_embeds": True,  # FLUX.2-klein uses guidance_embeds=False
+    "guidance_embeds": False,  # FLUX.2-klein uses guidance_embeds=False
 }
 
 
@@ -392,10 +392,31 @@ def _load_transformer_from_safetensors(model_path, dtype, *, proj_buffer: torch.
     transformer = _AsymFlux2Transformer2DModel(**TRANSFORMER_CONFIG)
     transformer.to(dtype=dtype)
 
+    # If the model has a guidance embedder but the checkpoint doesn't provide it,
+    # initialize it from the timestep embedder weights (or zeros) to avoid random behavior.
+    model_keys = set(transformer.state_dict().keys())
+    for suffix in ("linear_1.weight", "linear_2.weight"):
+        gk = f"time_guidance_embed.guidance_embedder.{suffix}"
+        tk = f"time_guidance_embed.timestep_embedder.{suffix}"
+        if gk in model_keys and gk not in converted_sd and tk in converted_sd:
+            converted_sd[gk] = converted_sd[tk]
+
     # Load weights (strict=False handles shape mismatches gracefully)
     missing, unexpected = transformer.load_state_dict(converted_sd, strict=False)
-    if missing:
-        print(f"[AsymFLUX] Warning: missing keys ({len(missing)}): {missing[:10]}")
+
+    # Some modules are optional depending on `guidance_embeds` and export format.
+    ignored_missing_prefixes = []
+    if not TRANSFORMER_CONFIG.get("guidance_embeds", True):
+        ignored_missing_prefixes.append("time_guidance_embed.guidance_embedder.")
+
+    missing_to_report = []
+    for k in missing:
+        if any(k.startswith(p) for p in ignored_missing_prefixes):
+            continue
+        missing_to_report.append(k)
+
+    if missing_to_report:
+        print(f"[AsymFLUX] Warning: missing keys ({len(missing_to_report)}): {missing_to_report[:10]}")
     if unexpected:
         print(f"[AsymFLUX] Warning: unexpected keys ({len(unexpected)}): {unexpected[:10]}")
 

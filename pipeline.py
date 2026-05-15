@@ -198,13 +198,13 @@ def _convert_comfyui_to_diffusers_keys(state_dict, *, proj_buffer: torch.Tensor 
     if proj_buffer_norm is None:
         proj_buffer_norm = _normalize_proj_buffer(proj_buffer_from_ckpt, expected_input_dim)
     if proj_buffer_norm is not None:
-        converted["_buffer_proj_buffer"] = proj_buffer_norm
+        converted["proj_buffer"] = proj_buffer_norm
 
     # If scale_buffer is provided (or exists in checkpoint), carry it through as a model buffer.
     if scale_buffer is None:
         scale_buffer = state_dict.get("scale_buffer")
     if scale_buffer is not None:
-        converted["_buffer_scale_buffer"] = scale_buffer
+        converted["scale_buffer"] = scale_buffer
     
     img_in = state_dict.get("img_in.weight")
     if img_in is not None:
@@ -217,7 +217,7 @@ def _convert_comfyui_to_diffusers_keys(state_dict, *, proj_buffer: torch.Tensor 
             #   x_embedder_full = img_in @ proj_buffer.T
             if base_rank is not None and img_in.shape == (hidden, base_rank) and proj_buffer_norm is not None:
                 converted["x_embedder.weight"] = img_in @ proj_buffer_norm.T
-                converted["_buffer_proj_buffer"] = proj_buffer_norm
+                converted["proj_buffer"] = proj_buffer_norm
             else:
                 print(
                     f"[AsymFLUX] Warning: img_in.weight shape {img_in.shape} does not match expected "
@@ -238,7 +238,7 @@ def _convert_comfyui_to_diffusers_keys(state_dict, *, proj_buffer: torch.Tensor 
         else:
             if base_rank is not None and x_embedder.shape == (hidden, base_rank) and proj_buffer_norm is not None:
                 converted["x_embedder.weight"] = x_embedder @ proj_buffer_norm.T
-                converted["_buffer_proj_buffer"] = proj_buffer_norm
+                converted["proj_buffer"] = proj_buffer_norm
             else:
                 print(
                     f"[AsymFLUX] Warning: x_embedder.weight shape {x_embedder.shape} does not match expected "
@@ -262,15 +262,22 @@ def _convert_comfyui_to_diffusers_keys(state_dict, *, proj_buffer: torch.Tensor 
     # Note: FLUX.2-klein has guidance_embeds=False, so guidance_in keys may not exist
 
     # Stream modulation
+    # Some checkpoints store these as "*.lin.weight" while the LakonLab/Diffusers model expects "*.linear.weight".
     mod_img = state_dict.get("double_stream_modulation_img.linear.weight")
+    if mod_img is None:
+        mod_img = state_dict.get("double_stream_modulation_img.lin.weight")
     if mod_img is not None:
         converted["double_stream_modulation_img.linear.weight"] = mod_img
 
     mod_txt = state_dict.get("double_stream_modulation_txt.linear.weight")
+    if mod_txt is None:
+        mod_txt = state_dict.get("double_stream_modulation_txt.lin.weight")
     if mod_txt is not None:
         converted["double_stream_modulation_txt.linear.weight"] = mod_txt
 
     mod_single = state_dict.get("single_stream_modulation.linear.weight")
+    if mod_single is None:
+        mod_single = state_dict.get("single_stream_modulation.lin.weight")
     if mod_single is not None:
         converted["single_stream_modulation.linear.weight"] = mod_single
 
@@ -320,7 +327,7 @@ def _convert_comfyui_to_diffusers_keys(state_dict, *, proj_buffer: torch.Tensor 
             #   proj_out_full = proj_buffer @ proj_out
             if base_rank is not None and proj_out.shape == (base_rank, hidden) and proj_buffer_norm is not None:
                 converted["proj_out.weight"] = proj_buffer_norm @ proj_out
-                converted["_buffer_proj_buffer"] = proj_buffer_norm
+                converted["proj_buffer"] = proj_buffer_norm
             else:
                 print(
                     f"[AsymFLUX] Warning: proj_out.weight shape {proj_out.shape} does not match expected "
@@ -330,13 +337,13 @@ def _convert_comfyui_to_diffusers_keys(state_dict, *, proj_buffer: torch.Tensor 
     # Copy subspace buffers from checkpoint if present (only if we didn't already inject overrides).
     proj_buffer_ckpt = state_dict.get("proj_buffer")
     proj_buffer_ckpt_norm = _normalize_proj_buffer(proj_buffer_ckpt, expected_input_dim)
-    if proj_buffer_ckpt_norm is not None and "_buffer_proj_buffer" not in converted:
-        converted["_buffer_proj_buffer"] = proj_buffer_ckpt_norm
+    if proj_buffer_ckpt_norm is not None and "proj_buffer" not in converted:
+        converted["proj_buffer"] = proj_buffer_ckpt_norm
         print(f"[AsymFLUX] Found proj_buffer in checkpoint: shape {proj_buffer_ckpt_norm.shape}")
 
     scale_buffer_ckpt = state_dict.get("scale_buffer")
-    if scale_buffer_ckpt is not None and "_buffer_scale_buffer" not in converted:
-        converted["_buffer_scale_buffer"] = scale_buffer_ckpt
+    if scale_buffer_ckpt is not None and "scale_buffer" not in converted:
+        converted["scale_buffer"] = scale_buffer_ckpt
         print(f"[AsymFLUX] Found scale_buffer in checkpoint: shape {scale_buffer_ckpt.shape}")
 
     return converted
@@ -360,6 +367,20 @@ def _load_transformer_from_safetensors(model_path, dtype, *, proj_buffer: torch.
     # Convert ComfyUI key format to Diffusers/LakonLab key format
     print("[AsymFLUX] Converting keys from ComfyUI format to Diffusers format...")
     converted_sd = _convert_comfyui_to_diffusers_keys(state_dict, proj_buffer=proj_buffer, scale_buffer=scale_buffer)
+    for k in (
+        "x_embedder.weight",
+        "proj_out.weight",
+        "norm_out.linear.weight",
+        "double_stream_modulation_img.linear.weight",
+        "double_stream_modulation_txt.linear.weight",
+        "single_stream_modulation.linear.weight",
+        "proj_buffer",
+        "scale_buffer",
+        "time_guidance_embed.timestep_embedder.linear_1.weight",
+        "time_guidance_embed.timestep_embedder.linear_2.weight",
+    ):
+        if k not in converted_sd:
+            print(f"[AsymFLUX] Warning: converted state dict missing critical key: {k}")
     
     # Clean up original state dict from memory
     del state_dict
@@ -369,17 +390,7 @@ def _load_transformer_from_safetensors(model_path, dtype, *, proj_buffer: torch.
     transformer = _AsymFlux2Transformer2DModel(**TRANSFORMER_CONFIG)
     transformer.to(dtype=dtype)
 
-    # Separate buffer keys from parameter keys
-    buffer_keys = [k for k in converted_sd.keys() if k.startswith("_buffer_")]
-    param_keys = [k for k in converted_sd.keys() if not k.startswith("_buffer_")]
-    
-    # Extract buffer values
-    buffers_to_load = {}
-    for bk in buffer_keys:
-        buffer_name = bk.replace("_buffer_", "", 1)
-        buffers_to_load[buffer_name] = converted_sd.pop(bk)
-
-    # Load parameter weights (strict=False handles shape mismatches gracefully)
+    # Load weights (strict=False handles shape mismatches gracefully)
     missing, unexpected = transformer.load_state_dict(converted_sd, strict=False)
     if missing:
         print(f"[AsymFLUX] Warning: missing keys ({len(missing)}): {missing[:10]}")
@@ -388,17 +399,6 @@ def _load_transformer_from_safetensors(model_path, dtype, *, proj_buffer: torch.
 
     # Clean up converted state dict from memory
     del converted_sd
-
-    # Load subspace buffers onto the transformer
-    transformer_device = next(transformer.parameters()).device
-    for buffer_name, buffer_value in buffers_to_load.items():
-        if hasattr(transformer, buffer_name):
-            transformer.register_buffer(buffer_name, buffer_value.to(device=transformer_device, dtype=dtype))
-            print(f"[AsymFLUX] Loaded buffer: {buffer_name} shape {buffer_value.shape}")
-        else:
-            # Register as new buffer if it doesn't exist yet
-            transformer.register_buffer(buffer_name, buffer_value.to(device=transformer_device, dtype=dtype))
-            print(f"[AsymFLUX] Registered new buffer: {buffer_name} shape {buffer_value.shape}")
 
     return transformer
 
@@ -607,10 +607,13 @@ class AsymFluxPipeWrapper:
 
         # Ensure prompt embeddings are on the same device and dtype as the model
         # ComfyUI's CLIP may output tensors on CPU in float32, but the transformer is on GPU in bfloat16
-        prompt_embeds = prompt_embeds.to(device=self.device, dtype=self.dtype)
-        negative_prompt_embeds = negative_prompt_embeds.to(device=self.device, dtype=self.dtype)
+        # Keep prompt embeddings in fp32 for numerical stability (the pipeline will cast as needed internally).
+        prompt_embeds = prompt_embeds.to(device=self.device, dtype=torch.float32)
+        negative_prompt_embeds = negative_prompt_embeds.to(device=self.device, dtype=torch.float32)
 
-        generator = torch.Generator(device="cpu").manual_seed(seed)
+        # Diffusers' randn_tensor expects a generator on the same device as the target latents.
+        # Using a CPU generator with CUDA latents can lead to errors or inconsistent behavior.
+        generator = torch.Generator(device=self.device).manual_seed(seed)
 
         # Pass pre-computed embeddings as plain tensors (not wrapped in lists).
         # The lakonlab PixelFlux2KleinPipeline.__call__ method determines batch_size

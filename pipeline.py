@@ -173,18 +173,35 @@ def _convert_comfyui_to_diffusers_keys(state_dict):
     # --- Top-level modules ---
     # Input projections (1:1 mapping)
     # ComfyUI format uses img_in/txt_in, Diffusers format uses x_embedder/context_embedder
+    # Check for subspace-projected base models where input dims are reduced to base_rank
+    in_channels = TRANSFORMER_CONFIG.get("in_channels", 3)
+    patch_size = TRANSFORMER_CONFIG.get("patch_size", 16)
+    expected_input_dim = in_channels * (patch_size ** 2)  # 3 * 256 = 768 for original model
+    
     img_in = state_dict.get("img_in.weight")
     if img_in is not None:
-        converted["x_embedder.weight"] = img_in
+        expected_x_embedder_shape = (hidden, expected_input_dim)  # (4096, 768)
+        if img_in.shape == expected_x_embedder_shape:
+            converted["x_embedder.weight"] = img_in
+        else:
+            # Subspace-projected base: img_in has shape [inner_dim, base_rank] instead of [inner_dim, in_channels*patch_size²]
+            print(f"[AsymFLUX] Warning: img_in.weight shape {img_in.shape} does not match expected "
+                  f"{expected_x_embedder_shape}. Skipping load (subspace-projected base detected).")
 
     txt_in = state_dict.get("txt_in.weight")
     if txt_in is not None:
+        # context_embedder shape should be [inner_dim, joint_attention_dim] - typically unchanged by subspace projection
         converted["context_embedder.weight"] = txt_in
 
     # Also handle if keys are already in Diffusers format (some exports)
     x_embedder = state_dict.get("x_embedder.weight")
     if x_embedder is not None and "x_embedder.weight" not in converted:
-        converted["x_embedder.weight"] = x_embedder
+        expected_x_embedder_shape = (hidden, expected_input_dim)  # (4096, 768)
+        if x_embedder.shape == expected_x_embedder_shape:
+            converted["x_embedder.weight"] = x_embedder
+        else:
+            print(f"[AsymFLUX] Warning: x_embedder.weight shape {x_embedder.shape} does not match expected "
+                  f"{expected_x_embedder_shape}. Skipping load (subspace-projected base detected).")
 
     context_embedder = state_dict.get("context_embedder.weight")
     if context_embedder is not None:

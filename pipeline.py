@@ -60,7 +60,7 @@ TRANSFORMER_CONFIG = {
     "eps": 1e-6,
     "sigma_min": 1e-4,
     "num_timesteps": 1,
-    "guidance_embeds": False,  # FLUX.2-klein uses guidance_embeds=False
+    "guidance_embeds": True,  # FLUX.2-klein uses guidance_embeds=False
 }
 
 

@@ -15,10 +15,12 @@ from safetensors.torch import load_file
 from lakonlab.models.architectures import OklabColorEncoder
 from lakonlab.models.diffusions.schedulers import FlowAdapterScheduler
 from lakonlab.pipelines.pipeline_pixelflux2_klein import PixelFlux2KleinPipeline
-from lakonlab.models.architectures.asymflow.asymflux2 import _AsymFlux2Transformer2DModel
+from lakonlab.models.architectures.asymflux.asymflux2 import _AsymFlux2Transformer2DModel
 
 
+# ---------------------------------------------------------------------------
 # Default scheduler parameters from the official example
+# ---------------------------------------------------------------------------
 DEFAULT_SCHEDULER_CONFIG = dict(
     shift=17.0,
     use_dynamic_shifting=True,
@@ -30,17 +32,18 @@ DEFAULT_SCHEDULER_CONFIG = dict(
     base_scheduler='UniPCMultistep',
 )
 
+# ---------------------------------------------------------------------------
 # Default Oklab color encoder parameters from the official example
+# ---------------------------------------------------------------------------
 DEFAULT_VAE_CONFIG = dict(
     use_affine_norm=True,
     mean=(0.56, 0.0, 0.01),
     std=0.16,
 )
 
+# ---------------------------------------------------------------------------
 # FLUX.2-klein transformer config for _AsymFlux2Transformer2DModel
-# These params are from LakonLab's official asymflux2_klein configs:
-#   configs/asymflow/asymflux2_klein_32gpus.py
-#   configs/asymflow/asymflux2_klein_test.py
+# ---------------------------------------------------------------------------
 TRANSFORMER_CONFIG = {
     "patch_size": 16,
     "in_channels": 3,
@@ -61,37 +64,201 @@ TRANSFORMER_CONFIG = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Key mapping: ComfyUI double_blocks/single_blocks format → Diffusers format
+# ---------------------------------------------------------------------------
+def _convert_comfyui_to_diffusers_keys(state_dict):
+    """
+    Convert safetensors keys from ComfyUI/piFlow format (double_blocks, single_blocks)
+    to Diffusers/LakonLab format (transformer_blocks, single_transformer_blocks).
+
+    The FLUX.2-klein base model safetensors stored in ComfyUI's diffusion_models
+    folder use the ComfyUI naming convention. The LakonLab _AsymFlux2Transformer2DModel
+    inherits from Diffusers' Flux2Transformer2DModel which expects Diffusers keys.
+
+    Returns a new state dict with converted keys and properly split/reshaped tensors.
+    """
+    converted = {}
+    n_double = TRANSFORMER_CONFIG["num_layers"]       # 8
+    n_single = TRANSFORMER_CONFIG["num_single_layers"] # 24
+    num_heads = TRANSFORMER_CONFIG["num_attention_heads"]  # 32
+    head_dim = TRANSFORMER_CONFIG["attention_head_dim"]      # 128
+    hidden = num_heads * head_dim  # 4096
+
+    # --- Double stream blocks: double_blocks.{i} → transformer_blocks.{i} ---
+    for i in range(n_double):
+        src = f"double_blocks.{i}"
+        dst = f"transformer_blocks.{i}"
+
+        # Image QKV: packed [Q|K|V] each of shape (hidden, hidden) → split into 3 tensors
+        qkv_img = state_dict.get(f"{src}.img_attn.qkv.weight")
+        if qkv_img is not None:
+            converted[f"{dst}.attn.to_q.weight"] = qkv_img[:hidden, :]
+            converted[f"{dst}.attn.to_k.weight"] = qkv_img[hidden:2*hidden, :]
+            converted[f"{dst}.attn.to_v.weight"] = qkv_img[2*hidden:3*hidden, :]
+
+        # Text (cross-attention) QKV: packed [Q|K|V] each of shape (hidden, joint_attention_dim)
+        qkv_txt = state_dict.get(f"{src}.txt_attn.qkv.weight")
+        if qkv_txt is not None:
+            converted[f"{dst}.attn.add_q_proj.weight"] = qkv_txt[:hidden, :]
+            converted[f"{dst}.attn.add_k_proj.weight"] = qkv_txt[hidden:2*hidden, :]
+            converted[f"{dst}.attn.add_v_proj.weight"] = qkv_txt[2*hidden:3*hidden, :]
+
+        # Image attention projection
+        proj_img = state_dict.get(f"{src}.img_attn.proj.weight")
+        if proj_img is not None:
+            converted[f"{dst}.attn.to_out.0.weight"] = proj_img
+
+        # Text attention projection
+        proj_txt = state_dict.get(f"{src}.txt_attn.proj.weight")
+        if proj_txt is not None:
+            converted[f"{dst}.attn.to_add_out.weight"] = proj_txt
+
+        # Image MLP
+        mlp_0 = state_dict.get(f"{src}.img_mlp.0.weight")
+        if mlp_0 is not None:
+            converted[f"{dst}.ff.linear_in.weight"] = mlp_0
+        mlp_2 = state_dict.get(f"{src}.img_mlp.2.weight")
+        if mlp_2 is not None:
+            converted[f"{dst}.ff.linear_out.weight"] = mlp_2
+
+        # Text MLP
+        txt_mlp_0 = state_dict.get(f"{src}.txt_mlp.0.weight")
+        if txt_mlp_0 is not None:
+            converted[f"{dst}.ff_context.linear_in.weight"] = txt_mlp_0
+        txt_mlp_2 = state_dict.get(f"{src}.txt_mlp.2.weight")
+        if txt_mlp_2 is not None:
+            converted[f"{dst}.ff_context.linear_out.weight"] = txt_mlp_2
+
+        # Image normalization scales
+        q_norm = state_dict.get(f"{src}.img_attn.norm.query_norm.scale")
+        if q_norm is not None:
+            converted[f"{dst}.attn.norm_q.weight"] = q_norm
+        k_norm = state_dict.get(f"{src}.img_attn.norm.key_norm.scale")
+        if k_norm is not None:
+            converted[f"{dst}.attn.norm_k.weight"] = k_norm
+
+        # Text normalization scales
+        tq_norm = state_dict.get(f"{src}.txt_attn.norm.query_norm.scale")
+        if tq_norm is not None:
+            converted[f"{dst}.attn.norm_added_q.weight"] = tq_norm
+        tk_norm = state_dict.get(f"{src}.txt_attn.norm.key_norm.scale")
+        if tk_norm is not None:
+            converted[f"{dst}.attn.norm_added_k.weight"] = tk_norm
+
+    # --- Single stream blocks: single_blocks.{i} → single_transformer_blocks.{i} ---
+    for i in range(n_single):
+        src = f"single_blocks.{i}"
+        dst = f"single_transformer_blocks.{i}"
+
+        # linear1 contains both attn (qkv+mlp_in) and the projection
+        # In Diffusers Flux2: attn.to_qkv_mlp_proj.weight + attn.to_out.weight are separate
+        # In ComfyUI: linear1 = same shape as to_qkv_mlp_proj, linear2 = to_out
+        linear1 = state_dict.get(f"{src}.linear1.weight")
+        if linear1 is not None:
+            converted[f"{dst}.attn.to_qkv_mlp_proj.weight"] = linear1
+
+        linear2 = state_dict.get(f"{src}.linear2.weight")
+        if linear2 is not None:
+            converted[f"{dst}.attn.to_out.weight"] = linear2
+
+        # Norm scales (stored at single_blocks.{i}.norm.*)
+        q_norm = state_dict.get(f"{src}.norm.query_norm.scale")
+        if q_norm is not None:
+            converted[f"{dst}.attn.norm_q.weight"] = q_norm
+        k_norm = state_dict.get(f"{src}.norm.key_norm.scale")
+        if k_norm is not None:
+            converted[f"{dst}.attn.norm_k.weight"] = k_norm
+
+    # --- Top-level modules ---
+    # Input projections (1:1 mapping)
+    x_embedder = state_dict.get("x_embedder.weight")
+    if x_embedder is not None:
+        converted["x_embedder.weight"] = x_embedder
+
+    context_embedder = state_dict.get("context_embedder.weight")
+    if context_embedder is not None:
+        converted["context_embedder.weight"] = context_embedder
+
+    # Time + guidance embedding
+    time_in_linear1 = state_dict.get("time_in.in_layer.weight")
+    if time_in_linear1 is not None:
+        converted["time_guidage_embed.timestep_embedder.linear_1.weight"] = time_in_linear1
+    time_in_linear2 = state_dict.get("time_in.out_layer.weight")
+    if time_in_linear2 is not None:
+        converted["time_guidance_embed.timestep_embedder.linear_2.weight"] = time_in_linear2
+
+    # Note: FLUX.2-klein has guidance_embeds=False, so guidance_in keys may not exist
+
+    # Stream modulation (ComfyUI: .linear → Diffusers: .lin)
+    mod_img = state_dict.get("double_stream_modulation_img.linear.weight")
+    if mod_img is not None:
+        converted["double_stream_modulation_img.lin.weight"] = mod_img
+
+    mod_txt = state_dict.get("double_stream_modulation_txt.linear.weight")
+    if mod_txt is not None:
+        converted["double_stream_modulation_txt.lin.weight"] = mod_txt
+
+    mod_single = state_dict.get("single_stream_modulation.linear.weight")
+    if mod_single is not None:
+        converted["single_stream_modulation.lin.weight"] = mod_single
+
+    # Output head
+    proj_out = state_dict.get("final_layer.linear.weight")
+    if proj_out is not None:
+        converted["final_layer.linear.weight"] = proj_out
+
+    norm_out = state_dict.get("final_layer.adaLN_modulation.1.weight")
+    if norm_out is not None:
+        # swap_scale_shift: FLUX normalizes with (scale, shift) swapped vs standard LayerNorm
+        # Diffusers Flux2 uses AdaLayerNormZero which expects [shift, scale] order
+        # The weight shape is (hidden, 2) — first half = shift, second half = scale
+        # For Flux2's swap_scale_shift normalization, we need to swap the halves
+        if norm_out.shape[1] == 2 * hidden:
+            shift_part = norm_out[:, :hidden]
+            scale_part = norm_out[:, hidden:]
+            swapped = torch.cat([scale_part, shift_part], dim=1)
+            converted["final_layer.adaLN_modulation.1.weight"] = swapped
+        else:
+            converted["final_layer.adaLN_modulation.1.weight"] = norm_out
+
+    # Position embedding (pos_embed is a buffer, not a weight key — skip it)
+
+    return converted
+
+
 def _load_transformer_from_safetensors(model_path, dtype):
     """
-    Load an _AsymFlux2Transformer2DModel from a raw safetensors file.
-    Uses LakonLab's custom AsymFLUX transformer (supports x_t, condition_latents args).
-    Follows the piFlow pattern: load state dict -> detect prefix -> build model -> load weights.
-    Uses an embedded config dict so no HuggingFace network call is needed.
+    Load an _AsymFlux2Transformer2DModel from a ComfyUI-format safetensors file.
+    
+    Converts keys from ComfyUI format (double_blocks.*, single_blocks.*) to 
+    Diffusers/LakonLab format (transformer_blocks.*, single_transformer_blocks.*).
+    
+    Follows the piFlow pattern: load state dict → convert keys → build model → load weights.
     """
     print(f"[AsymFLUX] Loading state dict from: {model_path}")
     state_dict = load_file(model_path)
 
-    # Strip any prefix (e.g. "transformer.") if present
-    prefix = ""
-    for key in list(state_dict.keys()):
-        if key.startswith("transformer."):
-            prefix = "transformer."
-            break
-
-    if prefix:
-        state_dict = {k[len(prefix):]: v for k, v in state_dict.items()}
+    # Convert ComfyUI key format to Diffusers/LakonLab key format
+    print("[AsymFLUX] Converting keys from ComfyUI format to Diffusers format...")
+    converted_sd = _convert_comfyui_to_diffusers_keys(state_dict)
+    
+    # Clean up original state dict from memory
+    del state_dict
 
     # Build transformer from local config using LakonLab's _AsymFlux2Transformer2DModel
-    # (no HuggingFace download needed)
     print("[AsymFLUX] Building _AsymFlux2Transformer2DModel from local config...")
     transformer = _AsymFlux2Transformer2DModel(**TRANSFORMER_CONFIG)
     transformer.to(dtype=dtype)
 
-    missing, unexpected = transformer.load_state_dict(state_dict, strict=False)
+    missing, unexpected = transformer.load_state_dict(converted_sd, strict=False)
     if missing:
-        print(f"[AsymFLUX] Warning: missing keys ({len(missing)}): {missing[:5]}")
+        print(f"[AsymFLUX] Warning: missing keys ({len(missing)}): {missing[:10]}")
     if unexpected:
-        print(f"[AsymFLUX] Warning: unexpected keys ({len(unexpected)}): {unexpected[:5]}")
+        print(f"[AsymFLUX] Warning: unexpected keys ({len(unexpected)}): {unexpected[:10]}")
+
+    # Clean up converted state dict from memory
+    del converted_sd
 
     return transformer
 
@@ -119,7 +286,7 @@ class AsymFluxPipeWrapper:
         print(f"[AsymFLUX] Loading adapter from: {adapter_path}")
         print(f"[AsymFLUX] dtype={dtype}, device={device}")
 
-        # --- Load transformer from local safetensors (piFlow pattern) ---
+        # --- Load transformer from local safetensors (converted from ComfyUI format) ---
         transformer = _load_transformer_from_safetensors(base_model_path, dtype)
 
         # --- Build VAE and scheduler (no text encoder needed - using ComfyUI CLIP) ---
@@ -138,35 +305,24 @@ class AsymFluxPipeWrapper:
             transformer=transformer,
         )
 
-        # --- Load adapter weights directly from safetensors (piFlow pattern) ---
-        # piFlow merges adapter weights into the base state dict BEFORE building
-        # the model, then uses load_model_weights which iterates key-by-key and
-        # silently skips mismatches. We replicate this pattern here: load the
-        # adapter state dict, then manually apply only keys that match both name
-        # AND shape — no load_state_dict call that can crash on size mismatch.
+        # --- Load adapter weights ---
+        # The adapter from Lakonik/AsymFLUX.2-klein-9B uses Diffusers format keys
+        # (transformer_blocks.*, single_transformer_blocks.*) since it's exported
+        # from the HuggingFace repo. We load it directly into the transformer.
         print(f"[AsymFLUX] Loading adapter from: {adapter_path}")
         adapter_state_dict = load_file(adapter_path)
 
-        # Strip any prefix if present (piFlow does the same with unet_prefix_from_state_dict)
-        prefix = ""
-        for key in list(adapter_state_dict.keys()):
-            if key.startswith("transformer."):
-                prefix = "transformer."
-                break
-            if key.startswith("model."):
-                prefix = "model."
-                break
-
-        if prefix:
-            adapter_state_dict = {k[len(prefix):]: v for k, v in adapter_state_dict.items()}
+        # Check if adapter uses ComfyUI format (double_blocks.*) or Diffusers format (transformer_blocks.*)
+        uses_comfyui_format = any(k.startswith("double_blocks.") for k in adapter_state_dict.keys())
+        
+        if uses_comfyui_format:
+            print("[AsymFLUX] Adapter is in ComfyUI format, converting to Diffusers format...")
+            adapter_state_dict = _convert_comfyui_to_diffusers_keys(adapter_state_dict)
 
         # Merge adapter weights into transformer using manual key-by-key copying.
-        # This is critical: load_state_dict with strict=False would still OVERWRITE
-        # ALL matching keys. But we only want to UPDATE keys that exist in BOTH
-        # the base model and adapter (typically LoRA/style adapter layers),
+        # Only update keys that exist in BOTH the base model and adapter,
         # preserving all other base model weights intact.
         merged_count = 0
-        skipped_missing = 0
         skipped_unexpected = 0
         transformer_state_dict = transformer.state_dict()
         
@@ -176,18 +332,16 @@ class AsymFluxPipeWrapper:
                     transformer_state_dict[key] = value.to(self.dtype)
                     merged_count += 1
                 else:
+                    print(f"[AsymFLUX] Adapter shape mismatch for {key}: "
+                          f"adapter={value.shape}, model={transformer_state_dict[key].shape}")
                     skipped_unexpected += 1
             else:
                 skipped_unexpected += 1
         
-        for key in transformer.state_dict():
-            if key not in adapter_state_dict:
-                skipped_missing += 1
-        
         transformer.load_state_dict(transformer_state_dict, strict=True)
         del transformer_state_dict
         
-        print(f"[AsymFLUX] Adapter merged: {merged_count} keys updated, {skipped_missing} base-only keys preserved, {skipped_unexpected} keys skipped")
+        print(f"[AsymFLUX] Adapter merged: {merged_count} keys updated, {skipped_unexpected} keys skipped")
 
         # Clean up adapter state dict from memory
         del adapter_state_dict
@@ -222,7 +376,7 @@ class AsymFluxPipeWrapper:
 
         Args:
             prompt_embeds: Pre-computed text embeddings from ComfyUI CLIP (B, seq_len, hidden)
-                         or (seq_len, hidden) - batch dimension will be added if missing
+                          or (seq_len, hidden) - batch dimension will be added if missing
             negative_prompt_embeds: Negative prompt embeddings from ComfyUI CLIP
         """
         # Ensure prompt embeddings have a batch dimension.

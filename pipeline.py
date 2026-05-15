@@ -11,6 +11,8 @@ and uses ComfyUI's CLIP system for text encoding, following the piFlow pattern.
 
 import math
 import torch
+import numpy as np
+from PIL import Image
 from safetensors.torch import load_file
 from lakonlab.models.architectures import OklabColorEncoder
 from lakonlab.models.diffusions.schedulers import FlowAdapterScheduler
@@ -619,6 +621,9 @@ class AsymFluxPipeWrapper:
         # The lakonlab PixelFlux2KleinPipeline.__call__ method determines batch_size
         # from prompt_embeds.shape[0] when prompt=None (line 147). Wrapping in a list
         # causes AttributeError: 'list' object has no attribute 'shape'.
+        # NOTE: PixelFlux2KleinPipeline's internal image_processor uses a scale factor that can
+        # make outputs appear 16x blockier in some ComfyUI environments. To avoid any implicit
+        # resizing/postprocess behavior, request `output_type="latent"` and decode to PIL here.
         result = self.pipe(
             prompt_embeds=prompt_embeds,
             negative_prompt_embeds=negative_prompt_embeds,
@@ -629,7 +634,12 @@ class AsymFluxPipeWrapper:
             orthogonal_guidance=orthogonal_guidance,
             clamp_denoised=clamp_denoised,
             generator=generator,
-            output_type="pil",
+            output_type="latent",
         )
 
-        return result.images
+        latents = result.images  # (B, 3, H, W), in Oklab space
+        image = self.pipe.vae.decode(latents.to(self.pipe.vae.dtype)).float()
+        image = (image / 2 + 0.5).clamp(0, 1)
+        image = image.permute(0, 2, 3, 1).cpu().numpy()
+        image = (image * 255.0).round().astype(np.uint8)
+        return [Image.fromarray(arr, mode="RGB") for arr in image]

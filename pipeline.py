@@ -15,7 +15,7 @@ from safetensors.torch import load_file
 from lakonlab.models.architectures import OklabColorEncoder
 from lakonlab.models.diffusions.schedulers import FlowAdapterScheduler
 from lakonlab.pipelines.pipeline_pixelflux2_klein import PixelFlux2KleinPipeline
-from lakonlab.models.architectures.asymflux.asymflux2 import _AsymFlux2Transformer2DModel
+from lakonlab.models.architectures.asymflow.asymflux2 import _AsymFlux2Transformer2DModel
 
 
 # ---------------------------------------------------------------------------

@@ -405,6 +405,73 @@ def _load_transformer_from_safetensors(model_path, dtype, *, proj_buffer: torch.
     return transformer
 
 
+def _merge_lora_weights_inplace(module: torch.nn.Module, lora_state_dict: dict, *, scale: float = 1.0, max_rows_per_chunk: int = 2048):
+    """
+    Merge LoRA weights stored as `*.lora_A.weight`/`*.lora_B.weight` into the corresponding base `*.weight`.
+
+    This repo's adapter safetensors (e.g. Lakonik/AsymFLUX.2-klein-9B) ships LoRA matrices directly, but our
+    runtime model is instantiated without PEFT modules. Loading the lora_* tensors via `load_state_dict` would
+    therefore do nothing. We merge them into the base weights instead.
+
+    Assumptions:
+    - LoRA uses the common layout: A: (r, in_features), B: (out_features, r).
+    - alpha == r (so alpha/r == 1.0). If you need different scaling, adjust `scale`.
+    """
+    if not lora_state_dict:
+        return 0
+
+    params = dict(module.named_parameters())
+
+    merged = 0
+    # Iterate over A matrices; require paired B.
+    for a_key, A in list(lora_state_dict.items()):
+        if not a_key.endswith(".lora_A.weight"):
+            continue
+        base = a_key[: -len(".lora_A.weight")]
+        b_key = f"{base}.lora_B.weight"
+        if b_key not in lora_state_dict:
+            continue
+
+        weight_key = f"{base}.weight"
+        if weight_key not in params:
+            continue
+
+        W_param = params[weight_key]
+        W = W_param.data
+        B = lora_state_dict[b_key]
+
+        # Validate shapes: W(out,in) ; A(r,in) ; B(out,r)
+        if W.ndim != 2 or A.ndim != 2 or B.ndim != 2:
+            continue
+        if A.shape[1] != W.shape[1] or B.shape[0] != W.shape[0] or B.shape[1] != A.shape[0]:
+            continue
+
+        # Move LoRA mats to W's device/dtype for merge
+        device = W.device
+        dtype = W.dtype
+        A = A.to(device=device, dtype=dtype)
+        B = B.to(device=device, dtype=dtype)
+
+        # Chunk along output rows to cap temporary memory usage.
+        out_features = W.shape[0]
+        r = A.shape[0]
+        # Heuristic chunk size by dtype size; keep it simple and user-tunable.
+        rows_per_chunk = max(1, min(max_rows_per_chunk, out_features))
+
+        with torch.no_grad():
+            for start in range(0, out_features, rows_per_chunk):
+                end = min(out_features, start + rows_per_chunk)
+                # (chunk, r) @ (r, in) -> (chunk, in)
+                delta = B[start:end, :].matmul(A)
+                if scale != 1.0:
+                    delta = delta * scale
+                W[start:end, :].add_(delta)
+
+        merged += 1
+
+    return merged
+
+
 class AsymFluxPipeWrapper:
     """
     Manages loading and caching of the PixelFlux2KleinPipeline.
@@ -528,51 +595,40 @@ class AsymFluxPipeWrapper:
                 transformer.register_buffer(buffer_name, buffer_value.to(dtype=self.dtype))
                 print(f"[AsymFLUX] Registered new buffer: {buffer_name} shape {buffer_value.shape}")
 
-        # Apply LoRA weights if present using the transformer's LoRA mechanism
-        if lora_adapter_sd:
-            # Check if transformer has LoRA support (from PEFT)
-            has_lora = hasattr(transformer, 'unload_lora') or any('lora' in p for p, _ in transformer.named_parameters())
-            if has_lora:
-                try:
-                    # Load LoRA state dict directly into the transformer
-                    # LoRA keys may have "transformer." prefix — strip it if present
-                    clean_lora_sd = {}
-                    for k, v in lora_adapter_sd.items():
-                        if k.startswith("transformer."):
-                            k = k[len("transformer."):]
-                        clean_lora_sd[k] = v
-                    
-                    transformer.load_state_dict(clean_lora_sd, strict=False)
-                    print(f"[AsymFLUX] LoRA weights applied: {len(clean_lora_sd)} keys")
-                except Exception as e:
-                    print(f"[AsymFLUX] Warning: Could not apply LoRA weights: {e}")
-            else:
-                # Fallback: merge LoRA weights directly if they match base model shapes
-                print("[AsymFLUX] LoRA fallback: merging weights directly")
-                transformer_state_dict = transformer.state_dict()
-                for key, value in lora_adapter_sd.items():
-                    clean_key = key
-                    if clean_key.startswith("transformer."):
-                        clean_key = clean_key[len("transformer."):]
-                    if clean_key in transformer_state_dict and transformer_state_dict[clean_key].shape == value.shape:
-                        transformer_state_dict[clean_key] = value.to(self.dtype)
-                transformer.load_state_dict(transformer_state_dict, strict=True)
-                del transformer_state_dict
+        # Keep LoRA matrices around until device placement so we can merge on GPU (much faster).
+        pending_lora_sd = lora_adapter_sd
 
         # Clean up adapter state dicts from memory
         del adapter_state_dict
         del base_adapter_sd
-        del lora_adapter_sd
         
         self.adapter_name = adapter_path  # track which adapter is loaded
         print(f"[AsymFLUX] Adapter loaded: {self.adapter_name}")
 
         # --- Device placement ---
         if self.enable_cpu_offload:
+            if pending_lora_sd:
+                # Merge on GPU first (if available), then enable offload.
+                try:
+                    if str(self.device).startswith("cuda") and torch.cuda.is_available():
+                        self.pipe.transformer = self.pipe.transformer.to(self.device)
+                    merged = _merge_lora_weights_inplace(self.pipe.transformer, pending_lora_sd, scale=1.0)
+                    print(f"[AsymFLUX] LoRA weights merged into base: {merged} modules")
+                except Exception as e:
+                    print(f"[AsymFLUX] Warning: Could not merge LoRA weights: {e}")
             self.pipe.enable_model_cpu_offload()
             print("[AsymFLUX] CPU offloading enabled.")
         else:
             self.pipe = self.pipe.to(self.device)
+            if pending_lora_sd:
+                try:
+                    merged = _merge_lora_weights_inplace(self.pipe.transformer, pending_lora_sd, scale=1.0)
+                    print(f"[AsymFLUX] LoRA weights merged into base: {merged} modules")
+                except Exception as e:
+                    print(f"[AsymFLUX] Warning: Could not merge LoRA weights: {e}")
+
+        # Clean up LoRA mats from memory after merge
+        del pending_lora_sd
 
         print("[AsymFLUX] Pipeline ready.")
 

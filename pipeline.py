@@ -67,7 +67,7 @@ TRANSFORMER_CONFIG = {
 # ---------------------------------------------------------------------------
 # Key mapping: ComfyUI double_blocks/single_blocks format → Diffusers format
 # ---------------------------------------------------------------------------
-def _convert_comfyui_to_diffusers_keys(state_dict):
+def _convert_comfyui_to_diffusers_keys(state_dict, *, proj_buffer: torch.Tensor | None = None, scale_buffer: torch.Tensor | None = None):
     """
     Convert safetensors keys from ComfyUI/piFlow format (double_blocks, single_blocks)
     to Diffusers/LakonLab format (transformer_blocks, single_transformer_blocks).
@@ -84,6 +84,19 @@ def _convert_comfyui_to_diffusers_keys(state_dict):
     num_heads = TRANSFORMER_CONFIG["num_attention_heads"]  # 32
     head_dim = TRANSFORMER_CONFIG["attention_head_dim"]      # 128
     hidden = num_heads * head_dim  # 4096
+    base_rank = TRANSFORMER_CONFIG.get("base_rank", None)
+
+    def _normalize_proj_buffer(buf: torch.Tensor | None, patch_dim: int):
+        """
+        Normalize proj_buffer to shape (patch_dim, base_rank) if possible.
+        """
+        if buf is None or base_rank is None:
+            return None
+        if buf.shape == (patch_dim, base_rank):
+            return buf
+        if buf.shape == (base_rank, patch_dim):
+            return buf.T
+        return None
 
     # --- Double stream blocks: double_blocks.{i} → transformer_blocks.{i} ---
     for i in range(n_double):
@@ -177,6 +190,21 @@ def _convert_comfyui_to_diffusers_keys(state_dict):
     in_channels = TRANSFORMER_CONFIG.get("in_channels", 3)
     patch_size = TRANSFORMER_CONFIG.get("patch_size", 16)
     expected_input_dim = in_channels * (patch_size ** 2)  # 3 * 256 = 768 for original model
+
+    # proj_buffer is needed to reconstruct full-rank x_embedder/proj_out for subspace-projected bases.
+    # Prefer explicit override (e.g., from adapter) over checkpoint-provided buffer.
+    proj_buffer_from_ckpt = state_dict.get("proj_buffer")
+    proj_buffer_norm = _normalize_proj_buffer(proj_buffer, expected_input_dim)
+    if proj_buffer_norm is None:
+        proj_buffer_norm = _normalize_proj_buffer(proj_buffer_from_ckpt, expected_input_dim)
+    if proj_buffer_norm is not None:
+        converted["_buffer_proj_buffer"] = proj_buffer_norm
+
+    # If scale_buffer is provided (or exists in checkpoint), carry it through as a model buffer.
+    if scale_buffer is None:
+        scale_buffer = state_dict.get("scale_buffer")
+    if scale_buffer is not None:
+        converted["_buffer_scale_buffer"] = scale_buffer
     
     img_in = state_dict.get("img_in.weight")
     if img_in is not None:
@@ -184,9 +212,17 @@ def _convert_comfyui_to_diffusers_keys(state_dict):
         if img_in.shape == expected_x_embedder_shape:
             converted["x_embedder.weight"] = img_in
         else:
-            # Subspace-projected base: img_in has shape [inner_dim, base_rank] instead of [inner_dim, in_channels*patch_size²]
-            print(f"[AsymFLUX] Warning: img_in.weight shape {img_in.shape} does not match expected "
-                  f"{expected_x_embedder_shape}. Skipping load (subspace-projected base detected).")
+            # Subspace-projected base: img_in has shape (inner_dim, base_rank).
+            # Reconstruct full-rank x_embedder.weight using proj_buffer if available:
+            #   x_embedder_full = img_in @ proj_buffer.T
+            if base_rank is not None and img_in.shape == (hidden, base_rank) and proj_buffer_norm is not None:
+                converted["x_embedder.weight"] = img_in @ proj_buffer_norm.T
+                converted["_buffer_proj_buffer"] = proj_buffer_norm
+            else:
+                print(
+                    f"[AsymFLUX] Warning: img_in.weight shape {img_in.shape} does not match expected "
+                    f"{expected_x_embedder_shape}. Skipping load (subspace-projected base detected)."
+                )
 
     txt_in = state_dict.get("txt_in.weight")
     if txt_in is not None:
@@ -200,36 +236,43 @@ def _convert_comfyui_to_diffusers_keys(state_dict):
         if x_embedder.shape == expected_x_embedder_shape:
             converted["x_embedder.weight"] = x_embedder
         else:
-            print(f"[AsymFLUX] Warning: x_embedder.weight shape {x_embedder.shape} does not match expected "
-                  f"{expected_x_embedder_shape}. Skipping load (subspace-projected base detected).")
+            if base_rank is not None and x_embedder.shape == (hidden, base_rank) and proj_buffer_norm is not None:
+                converted["x_embedder.weight"] = x_embedder @ proj_buffer_norm.T
+                converted["_buffer_proj_buffer"] = proj_buffer_norm
+            else:
+                print(
+                    f"[AsymFLUX] Warning: x_embedder.weight shape {x_embedder.shape} does not match expected "
+                    f"{expected_x_embedder_shape}. Skipping load (subspace-projected base detected)."
+                )
 
     context_embedder = state_dict.get("context_embedder.weight")
     if context_embedder is not None:
         converted["context_embedder.weight"] = context_embedder
 
     # Time + guidance embedding
-    # Diffusers Flux2Transformer2DModel uses "time_in.*" keys
+    # ComfyUI checkpoints commonly store this as time_in.* while LakonLab/Diffusers uses
+    # time_guidance_embed.timestep_embedder.linear_{1,2}.*
     time_in_linear1 = state_dict.get("time_in.in_layer.weight")
     if time_in_linear1 is not None:
-        converted["time_in.in_layer.weight"] = time_in_linear1
+        converted["time_guidance_embed.timestep_embedder.linear_1.weight"] = time_in_linear1
     time_in_linear2 = state_dict.get("time_in.out_layer.weight")
     if time_in_linear2 is not None:
-        converted["time_in.out_layer.weight"] = time_in_linear2
+        converted["time_guidance_embed.timestep_embedder.linear_2.weight"] = time_in_linear2
 
     # Note: FLUX.2-klein has guidance_embeds=False, so guidance_in keys may not exist
 
-    # Stream modulation (ComfyUI: .linear → Diffusers: .lin)
+    # Stream modulation
     mod_img = state_dict.get("double_stream_modulation_img.linear.weight")
     if mod_img is not None:
-        converted["double_stream_modulation_img.lin.weight"] = mod_img
+        converted["double_stream_modulation_img.linear.weight"] = mod_img
 
     mod_txt = state_dict.get("double_stream_modulation_txt.linear.weight")
     if mod_txt is not None:
-        converted["double_stream_modulation_txt.lin.weight"] = mod_txt
+        converted["double_stream_modulation_txt.linear.weight"] = mod_txt
 
     mod_single = state_dict.get("single_stream_modulation.linear.weight")
     if mod_single is not None:
-        converted["single_stream_modulation.lin.weight"] = mod_single
+        converted["single_stream_modulation.linear.weight"] = mod_single
 
     # Input projections (these should already be 1:1, but ensure they're included)
     x_embedder = state_dict.get("x_embedder.weight")
@@ -249,11 +292,14 @@ def _convert_comfyui_to_diffusers_keys(state_dict):
 
     norm_out = state_dict.get("final_layer.adaLN_modulation.1.weight")
     if norm_out is not None:
-        # swap_scale_shift: FLUX normalizes with (scale, shift) swapped vs standard LayerNorm
-        # Diffusers Flux2 uses AdaLayerNormZero which expects [shift, scale] order
-        # The weight shape is (hidden, 2) — first half = shift, second half = scale
-        # For Flux2's swap_scale_shift normalization, we need to swap the halves
-        if norm_out.shape[1] == 2 * hidden:
+        # swap_scale_shift: FLUX stores (shift, scale) swapped vs the order expected by Diffusers.
+        # Handle both common linear weight layouts:
+        # - (2*hidden, hidden): swap along output dim (rows)
+        # - (hidden, 2*hidden): swap along input dim (cols)
+        if norm_out.shape == (2 * hidden, hidden):
+            swapped = torch.cat([norm_out[hidden:], norm_out[:hidden]], dim=0)
+            converted["norm_out.linear.weight"] = swapped
+        elif norm_out.shape == (hidden, 2 * hidden):
             shift_part = norm_out[:, :hidden]
             scale_part = norm_out[:, hidden:]
             swapped = torch.cat([scale_part, shift_part], dim=1)
@@ -269,27 +315,34 @@ def _convert_comfyui_to_diffusers_keys(state_dict):
         if proj_out.shape == expected_proj_shape:
             converted["proj_out.weight"] = proj_out
         else:
-            # Base model was subspace-projected: proj_out has shape [base_rank, inner_dim]
-            # e.g., (128, 4096) instead of (768, 4096). Skip loading it — the adapter
-            # will provide the correct subspace-projected proj_out weights.
-            print(f"[AsymFLUX] Warning: proj_out.weight shape {proj_out.shape} does not match expected "
-                  f"{expected_proj_shape}. Skipping load (subspace-projected base detected).")
+            # Subspace-projected base: proj_out has shape (base_rank, inner_dim).
+            # Reconstruct full-rank proj_out.weight using proj_buffer if available:
+            #   proj_out_full = proj_buffer @ proj_out
+            if base_rank is not None and proj_out.shape == (base_rank, hidden) and proj_buffer_norm is not None:
+                converted["proj_out.weight"] = proj_buffer_norm @ proj_out
+                converted["_buffer_proj_buffer"] = proj_buffer_norm
+            else:
+                print(
+                    f"[AsymFLUX] Warning: proj_out.weight shape {proj_out.shape} does not match expected "
+                    f"{expected_proj_shape}. Skipping load (subspace-projected base detected)."
+                )
 
-    # Copy subspace buffers from checkpoint if present
-    proj_buffer = state_dict.get("proj_buffer")
-    if proj_buffer is not None:
-        converted["_buffer_proj_buffer"] = proj_buffer
-        print(f"[AsymFLUX] Found proj_buffer in checkpoint: shape {proj_buffer.shape}")
+    # Copy subspace buffers from checkpoint if present (only if we didn't already inject overrides).
+    proj_buffer_ckpt = state_dict.get("proj_buffer")
+    proj_buffer_ckpt_norm = _normalize_proj_buffer(proj_buffer_ckpt, expected_input_dim)
+    if proj_buffer_ckpt_norm is not None and "_buffer_proj_buffer" not in converted:
+        converted["_buffer_proj_buffer"] = proj_buffer_ckpt_norm
+        print(f"[AsymFLUX] Found proj_buffer in checkpoint: shape {proj_buffer_ckpt_norm.shape}")
 
-    scale_buffer = state_dict.get("scale_buffer")
-    if scale_buffer is not None:
-        converted["_buffer_scale_buffer"] = scale_buffer
-        print(f"[AsymFLUX] Found scale_buffer in checkpoint: shape {scale_buffer.shape}")
+    scale_buffer_ckpt = state_dict.get("scale_buffer")
+    if scale_buffer_ckpt is not None and "_buffer_scale_buffer" not in converted:
+        converted["_buffer_scale_buffer"] = scale_buffer_ckpt
+        print(f"[AsymFLUX] Found scale_buffer in checkpoint: shape {scale_buffer_ckpt.shape}")
 
     return converted
 
 
-def _load_transformer_from_safetensors(model_path, dtype):
+def _load_transformer_from_safetensors(model_path, dtype, *, proj_buffer: torch.Tensor | None = None, scale_buffer: torch.Tensor | None = None):
     """
     Load an _AsymFlux2Transformer2DModel from a ComfyUI-format safetensors file.
     
@@ -306,7 +359,7 @@ def _load_transformer_from_safetensors(model_path, dtype):
 
     # Convert ComfyUI key format to Diffusers/LakonLab key format
     print("[AsymFLUX] Converting keys from ComfyUI format to Diffusers format...")
-    converted_sd = _convert_comfyui_to_diffusers_keys(state_dict)
+    converted_sd = _convert_comfyui_to_diffusers_keys(state_dict, proj_buffer=proj_buffer, scale_buffer=scale_buffer)
     
     # Clean up original state dict from memory
     del state_dict
@@ -337,13 +390,14 @@ def _load_transformer_from_safetensors(model_path, dtype):
     del converted_sd
 
     # Load subspace buffers onto the transformer
+    transformer_device = next(transformer.parameters()).device
     for buffer_name, buffer_value in buffers_to_load.items():
         if hasattr(transformer, buffer_name):
-            transformer.register_buffer(buffer_name, buffer_value.to(dtype=dtype))
+            transformer.register_buffer(buffer_name, buffer_value.to(device=transformer_device, dtype=dtype))
             print(f"[AsymFLUX] Loaded buffer: {buffer_name} shape {buffer_value.shape}")
         else:
             # Register as new buffer if it doesn't exist yet
-            transformer.register_buffer(buffer_name, buffer_value.to(dtype=dtype))
+            transformer.register_buffer(buffer_name, buffer_value.to(device=transformer_device, dtype=dtype))
             print(f"[AsymFLUX] Registered new buffer: {buffer_name} shape {buffer_value.shape}")
 
     return transformer
@@ -372,8 +426,48 @@ class AsymFluxPipeWrapper:
         print(f"[AsymFLUX] Loading adapter from: {adapter_path}")
         print(f"[AsymFLUX] dtype={dtype}, device={device}")
 
+        # --- Load adapter first (needed to reconstruct full-rank weights for subspace-projected bases) ---
+        # The adapter from Lakonik/AsymFLUX.2-klein-9B uses Diffusers format keys
+        # (transformer_blocks.*, single_transformer_blocks.*) since it's exported
+        # from the HuggingFace repo. Some users may also have a ComfyUI-format adapter.
+        adapter_state_dict = load_file(adapter_path)
+
+        # Check if adapter uses ComfyUI format (double_blocks.*) or Diffusers format (transformer_blocks.*)
+        uses_comfyui_format = any(k.startswith("double_blocks.") for k in adapter_state_dict.keys())
+
+        if uses_comfyui_format:
+            print("[AsymFLUX] Adapter is in ComfyUI format, converting to Diffusers format...")
+            adapter_state_dict = _convert_comfyui_to_diffusers_keys(adapter_state_dict)
+
+        # Separate base weights from LoRA weights and buffer keys.
+        # LoRA keys contain "lora_A" or "lora_B" and have different shapes than base model weights.
+        # Buffer keys (proj_buffer, scale_buffer) are not parameters — they must be handled separately.
+        base_adapter_sd = {}
+        lora_adapter_sd = {}
+        adapter_buffers = {}
+
+        for key, value in adapter_state_dict.items():
+            if "lora" in key.lower():
+                lora_adapter_sd[key] = value
+            elif key in ("proj_buffer", "scale_buffer"):
+                adapter_buffers[key] = value
+            else:
+                base_adapter_sd[key] = value
+
+        if lora_adapter_sd:
+            print(f"[AsymFLUX] Found {len(lora_adapter_sd)} LoRA keys in adapter (will be applied via LoRA mechanism)")
+
+        if adapter_buffers:
+            print(f"[AsymFLUX] Found {len(adapter_buffers)} buffer keys in adapter: {list(adapter_buffers.keys())}")
+
         # --- Load transformer from local safetensors (converted from ComfyUI format) ---
-        transformer = _load_transformer_from_safetensors(base_model_path, dtype)
+        # Pass adapter buffers so we can reconstruct full-rank x_embedder/proj_out when the base is subspace-projected.
+        transformer = _load_transformer_from_safetensors(
+            base_model_path,
+            dtype,
+            proj_buffer=adapter_buffers.get("proj_buffer"),
+            scale_buffer=adapter_buffers.get("scale_buffer"),
+        )
 
         # --- Build VAE and scheduler (no text encoder needed - using ComfyUI CLIP) ---
         vae = OklabColorEncoder(**DEFAULT_VAE_CONFIG)
@@ -390,41 +484,6 @@ class AsymFluxPipeWrapper:
             tokenizer=None,
             transformer=transformer,
         )
-
-        # --- Load adapter weights ---
-        # The adapter from Lakonik/AsymFLUX.2-klein-9B uses Diffusers format keys
-        # (transformer_blocks.*, single_transformer_blocks.*) since it's exported
-        # from the HuggingFace repo. We load it directly into the transformer.
-        print(f"[AsymFLUX] Loading adapter from: {adapter_path}")
-        adapter_state_dict = load_file(adapter_path)
-
-        # Check if adapter uses ComfyUI format (double_blocks.*) or Diffusers format (transformer_blocks.*)
-        uses_comfyui_format = any(k.startswith("double_blocks.") for k in adapter_state_dict.keys())
-        
-        if uses_comfyui_format:
-            print("[AsymFLUX] Adapter is in ComfyUI format, converting to Diffusers format...")
-            adapter_state_dict = _convert_comfyui_to_diffusers_keys(adapter_state_dict)
-
-        # Separate base weights from LoRA weights and buffer keys.
-        # LoRA keys contain "lora_A" or "lora_B" and have different shapes than base model weights.
-        # Buffer keys (proj_buffer, scale_buffer) are not parameters — they must be handled separately.
-        base_adapter_sd = {}
-        lora_adapter_sd = {}
-        adapter_buffers = {}
-        
-        for key, value in adapter_state_dict.items():
-            if "lora" in key.lower():
-                lora_adapter_sd[key] = value
-            elif key in ("proj_buffer", "scale_buffer"):
-                adapter_buffers[key] = value
-            else:
-                base_adapter_sd[key] = value
-        
-        if lora_adapter_sd:
-            print(f"[AsymFLUX] Found {len(lora_adapter_sd)} LoRA keys in adapter (will be applied via LoRA mechanism)")
-        
-        if adapter_buffers:
-            print(f"[AsymFLUX] Found {len(adapter_buffers)} buffer keys in adapter: {list(adapter_buffers.keys())}")
 
         # Merge base adapter weights into transformer using manual key-by-key copying.
         # Only update keys that exist in BOTH the base model and adapter,
@@ -488,6 +547,7 @@ class AsymFluxPipeWrapper:
             else:
                 # Fallback: merge LoRA weights directly if they match base model shapes
                 print("[AsymFLUX] LoRA fallback: merging weights directly")
+                transformer_state_dict = transformer.state_dict()
                 for key, value in lora_adapter_sd.items():
                     clean_key = key
                     if clean_key.startswith("transformer."):
@@ -495,6 +555,7 @@ class AsymFluxPipeWrapper:
                     if clean_key in transformer_state_dict and transformer_state_dict[clean_key].shape == value.shape:
                         transformer_state_dict[clean_key] = value.to(self.dtype)
                 transformer.load_state_dict(transformer_state_dict, strict=True)
+                del transformer_state_dict
 
         # Clean up adapter state dicts from memory
         del adapter_state_dict

@@ -231,18 +231,13 @@ class AsymFluxPipeWrapper:
 
         generator = torch.Generator(device="cpu").manual_seed(seed)
 
-        # Wrap pre-computed embeddings in a list so PixelFlux2KleinPipeline.encode_prompt
-        # correctly detects them as "already-encoded tensors".
-        #
-        # encode_prompt checks: isinstance(prompt[0], torch.Tensor)
-        #   - When prompt is a bare tensor [1, 512, 12288], prompt[0] = [512, 12288] is a
-        #     Tensor → it treats 512 as batch_size → text_ids gets shape [512, 512, 4]
-        #     instead of [1, 512, 4] → attention fails → only noise output.
-        #   - When prompt is a list [[1, 512, 12288]], prompt[0] = [1, 512, 12288] is a
-        #     Tensor → batch_size = 1 → text_ids gets correct shape [1, 512, 4].
+        # Pass pre-computed embeddings as plain tensors (not wrapped in lists).
+        # The lakonlab PixelFlux2KleinPipeline.__call__ method determines batch_size
+        # from prompt_embeds.shape[0] when prompt=None (line 147). Wrapping in a list
+        # causes AttributeError: 'list' object has no attribute 'shape'.
         result = self.pipe(
-            prompt_embeds=[prompt_embeds],
-            negative_prompt_embeds=[negative_prompt_embeds],
+            prompt_embeds=prompt_embeds,
+            negative_prompt_embeds=negative_prompt_embeds,
             width=width,
             height=height,
             num_inference_steps=num_inference_steps,
